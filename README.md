@@ -112,11 +112,17 @@ digests/
 
 ## macOS App
 
-Double-click `ArxivRecommend.app` to run the full pipeline. It will:
-1. Load credentials from `.env`
-2. Run the recommender
-3. Open the latest digest
-4. Show a notification with results
+The `.app` bundle is not included in the repo. To build it:
+
+```bash
+./build_app.sh
+```
+
+Then double-click `ArXivDailyDigest.app` to run. It will:
+1. Auto-create a `.venv` and install dependencies (first run)
+2. Load credentials from `.env`
+3. Start the Web UI server
+4. Open your browser to the digest
 
 ## Requirements
 

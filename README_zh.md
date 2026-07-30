@@ -20,8 +20,14 @@
 
 ### 方式一：macOS 应用（推荐）
 
-双击 `ArxivRecommend.app`，浏览器自动打开：
-- 首次使用：显示设置向导，引导配置 API 密钥和研究兴趣
+仓库不包含 `.app` 文件，需先构建：
+
+```bash
+./build_app.sh
+```
+
+然后双击 `ArXivDailyDigest.app`，浏览器自动打开：
+- 首次使用：自动创建虚拟环境并安装依赖，显示设置向导
 - 后续使用：直接显示最新论文摘要
 
 ### 方式二：命令行
@@ -148,6 +154,7 @@ arXiv 在工作日发布新论文（美东时间 20:00 = 北京时间次日 08:0
 
 ```
 ├── main.py              # 命令行入口
+├── build_app.sh         # macOS .app 构建脚本
 ├── config.yaml          # 配置文件
 ├── .env                 # 环境变量（API key 等）
 ├── .env.example         # 环境变量模板
@@ -166,7 +173,7 @@ arXiv 在工作日发布新论文（美东时间 20:00 = 北京时间次日 08:0
 │   ├── bibtex/          # BibTeX 文件
 │   └── digests/         # Markdown 摘要
 ├── assets/              # 应用图标
-└── ArxivRecommend.app/  # macOS 应用包
+└── ArXivDailyDigest.app/ # macOS 应用包（由 build_app.sh 生成）
 ```
 
 ## 环境要求
