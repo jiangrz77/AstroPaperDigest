@@ -8,6 +8,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Remove macOS quarantine if present (from ZIP downloads)
+xattr -cr . 2>/dev/null || true
+
 APP_NAME="ArXivDailyDigest"
 APP_DIR="$APP_NAME.app"
 
@@ -35,9 +38,9 @@ cat > "$APP_DIR/Contents/Info.plist" << 'EOF'
     <key>CFBundleDisplayName</key>
     <string>ArXivDailyDigest</string>
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>1.0.1</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.0.1</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleIconFile</key>
@@ -75,9 +78,10 @@ PROJECT_DIR="$(cd "$APP_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
 
 # Detect Python: prefer .venv, then venv, then system python3
-# On first run, create .venv and install dependencies automatically
-if [ ! -f "$PROJECT_DIR/.venv/bin/python3" ]; then
-    osascript -e 'display notification "First run: setting up Python environment..." with title "ArXivDailyDigest"'
+# On first run (or if venv is broken/moved), create .venv and install dependencies
+if ! "$PROJECT_DIR/.venv/bin/python3" -c "pass" 2>/dev/null; then
+    rm -rf "$PROJECT_DIR/.venv"
+    osascript -e 'display notification "Setting up Python environment..." with title "ArXivDailyDigest"'
     python3 -m venv "$PROJECT_DIR/.venv"
     "$PROJECT_DIR/.venv/bin/pip" install --upgrade pip -q
     "$PROJECT_DIR/.venv/bin/pip" install -r "$PROJECT_DIR/requirements.txt" -q
@@ -208,3 +212,11 @@ echo ""
 echo "Done! Created: $APP_DIR"
 echo "Python venv ready at .venv/"
 echo "Double-click $APP_DIR to launch ArXivDailyDigest."
+
+# Optionally link to /Applications for Launchpad/Spotlight access
+LINK_PATH="/Applications/$APP_NAME.app"
+if [ -L "$LINK_PATH" ] || [ ! -e "$LINK_PATH" ]; then
+    ln -sf "$SCRIPT_DIR/$APP_DIR" "$LINK_PATH" 2>/dev/null && \
+        echo "Linked to $LINK_PATH" || \
+        echo "Tip: run 'sudo ln -sf \"$SCRIPT_DIR/$APP_DIR\" $LINK_PATH' for Launchpad access"
+fi

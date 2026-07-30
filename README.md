@@ -20,6 +20,8 @@ Automatically fetches, filters, and ranks daily arXiv papers based on your resea
 
 ### Option 1: macOS App (Recommended)
 
+> **Note:** Do not run from `~/Downloads/` — macOS blocks downloaded files. Move the project to a permanent location first (e.g., `~/Projects/` or `~/Applications/`).
+
 The `.app` bundle is not included in the repo. Build it first:
 
 ```bash
@@ -29,6 +31,8 @@ The `.app` bundle is not included in the repo. Build it first:
 Then double-click `ArXivDailyDigest.app` — your browser opens automatically:
 - First run: Shows the setup wizard
 - Subsequent runs: Displays the latest paper digest directly
+
+> **macOS security prompt?** On first launch, macOS may block the app. Go to **System Settings → Privacy & Security**, then click **"Open Anyway"**. This only happens once.
 
 ### Option 2: Command Line
 
