@@ -1,0 +1,42 @@
+# Secrets - NEVER commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Generated outputs
+output/
+feedback.json
+preferences.json
+error.log
+
+# Personal data (contains local paths)
+data/AllCollection.bib
+data/ArxivDailyCollection.bib
+AllCollection.bib
+
+# macOS artifacts
+.DS_Store
+Thumbs.db
+
+# macOS app bundle (platform-specific, generated)
+ArXivDailyDigest.app/
+
+# Logs
+*.log
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+
+# Canvas reports (IDE-generated)
+*.canvas.tsx
+*.canvas.data.json

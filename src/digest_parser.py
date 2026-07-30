@@ -1,0 +1,161 @@
+"""Parse markdown digest files into structured paper entries."""
+
+import re
+from datetime import date
+
+
+def parse_digest(digest_path: str) -> dict:
+    """Parse a markdown digest file into structured data.
+    
+    Returns:
+        dict with keys: date, total_papers, highly_relevant_count, tiers
+        where tiers is a list of {"name": str, "papers": [paper_dict, ...]}
+    """
+    with open(digest_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    
+    result = {
+        "date": "",
+        "total_papers": 0,
+        "highly_relevant_count": 0,
+        "tiers": [],
+    }
+    
+    # Extract header info
+    date_match = re.search(r"# (?:ArXivDailyDigest|Arxiv Daily Digest) - (\d{4}-\d{2}-\d{2})", content)
+    if date_match:
+        result["date"] = date_match.group(1)
+    
+    total_match = re.search(r"\*\*Total papers reviewed:\*\* (\d+)", content)
+    if total_match:
+        result["total_papers"] = int(total_match.group(1))
+    
+    high_match = re.search(r"\*\*Highly relevant.*?:\*\* (\d+)", content)
+    if high_match:
+        result["highly_relevant_count"] = int(high_match.group(1))
+    
+    status_match = re.search(r"\*\*Status:\*\* (\w+)", content)
+    if status_match:
+        result["status"] = status_match.group(1)
+    
+    # Split into tiers by ## headers
+    tier_sections = re.split(r"^## ", content, flags=re.MULTILINE)
+    
+    for section in tier_sections[1:]:  # Skip header before first ##
+        lines = section.strip().split("\n")
+        tier_name = lines[0].strip()
+        papers = _parse_papers_in_section("\n".join(lines[1:]))
+        if papers:
+            result["tiers"].append({"name": tier_name, "papers": papers})
+    
+    return result
+
+
+def _parse_papers_in_section(section_text: str) -> list:
+    """Parse individual paper entries from a tier section."""
+    papers = []
+    
+    # Split by ### headers (paper titles)
+    paper_blocks = re.split(r"^### ", section_text, flags=re.MULTILINE)
+    
+    for block in paper_blocks[1:]:  # Skip text before first ###
+        paper = _parse_single_paper(block.strip())
+        if paper:
+            papers.append(paper)
+    
+    return papers
+
+
+def _parse_single_paper(block: str) -> dict:
+    """Parse a single paper block into a dict."""
+    lines = block.split("\n")
+    if not lines:
+        return None
+    
+    raw_title = lines[0].strip()
+    
+    # Extract paper type from title suffix
+    paper_type = "new"
+    title = raw_title
+    if raw_title.endswith("[Cross-listed]"):
+        paper_type = "cross"
+        title = raw_title[:-len("[Cross-listed]")].strip()
+    elif raw_title.endswith("[Replacement]"):
+        paper_type = "replacement"
+        title = raw_title[:-len("[Replacement]")].strip()
+    
+    paper = {
+        "title": title,
+        "score": 0,
+        "reason": "",
+        "authors": "",
+        "categories": "",
+        "link": "",
+        "paper_id": "",
+        "abstract": "",
+        "paper_type": paper_type,
+    }
+    
+    # Extract score and reason
+    score_match = re.search(r"\*\*Score:\*\* (\d+)/10 \| \*\*Reason:\*\* (.+)", block)
+    if score_match:
+        paper["score"] = int(score_match.group(1))
+        paper["reason"] = score_match.group(2).strip()
+    
+    # Extract authors
+    authors_match = re.search(r"\*\*Authors:\*\* (.+)", block)
+    if authors_match:
+        paper["authors"] = authors_match.group(1).strip()
+    
+    # Extract categories
+    cats_match = re.search(r"\*\*Categories:\*\* (.+)", block)
+    if cats_match:
+        paper["categories"] = cats_match.group(1).strip()
+    
+    # Extract link and paper ID
+    link_match = re.search(r"\*\*Link:\*\* \[([^\]]+)\]\(([^)]+)\)", block)
+    if link_match:
+        paper["paper_id"] = link_match.group(1)
+        paper["link"] = link_match.group(2)
+    
+    # Extract abstract (lines starting with >)
+    abstract_lines = []
+    for line in lines:
+        if line.startswith("> "):
+            abstract_lines.append(line[2:])
+    paper["abstract"] = " ".join(abstract_lines).strip()
+    
+    return paper
+
+
+def get_latest_digest_path(digest_dir: str = "./output/digests") -> str:
+    """Find the most recent digest file."""
+    import os
+    import glob
+    
+    pattern = os.path.join(digest_dir, "digest_*.md")
+    files = glob.glob(pattern)
+    if not files:
+        return ""
+    return max(files)  # Lexicographic max works for YYYY-MM-DD format
+
+
+def get_digest_path_for_date(date_str: str, digest_dir: str = "./output/digests") -> str:
+    """Get digest file path for a specific date (YYYY-MM-DD). Returns '' if not found."""
+    import os
+    path = os.path.join(digest_dir, f"digest_{date_str}.md")
+    return path if os.path.exists(path) else ""
+
+
+def get_available_dates(digest_dir: str = "./output/digests") -> list:
+    """Return sorted list of dates that have digest files (newest first)."""
+    import os
+    import glob
+    
+    pattern = os.path.join(digest_dir, "digest_*.md")
+    dates = []
+    for f in glob.glob(pattern):
+        m = re.search(r"digest_(\d{4}-\d{2}-\d{2})\.md", os.path.basename(f))
+        if m:
+            dates.append(m.group(1))
+    return sorted(dates, reverse=True)

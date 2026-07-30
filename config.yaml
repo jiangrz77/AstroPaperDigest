@@ -1,0 +1,77 @@
+arxiv_categories:
+- astro-ph.GA
+- astro-ph.SR
+keywords:
+- first stars
+- Population III
+- extremely metal-poor
+- metal-poor stars
+- carbon-enhanced
+- reionization
+- high redshift
+- chemical enrichment
+- chemical evolution
+- nucleosynthesis
+- stellar abundances
+- abundance analysis
+- r-process
+- s-process
+- initial mass function
+- supernova
+- supernovae
+- core-collapse
+- pair-instability
+- Type Ia
+- Type II
+- hypernova
+- kilonova
+- stellar evolution
+- massive stars
+- red supergiant
+- red giant
+- AGB
+- white dwarf
+- binary
+- M dwarf
+- stellar atmospheres
+- Milky Way
+- galactic halo
+- globular clusters
+- dwarf galaxy
+- circumgalactic
+- galaxy formation
+- Gaia
+- JWST
+- LAMOST
+- APOGEE
+- spectroscopic survey
+- spectroscopy
+- spectral lines
+- line parameters
+- atomic data
+- molecular data
+- photometry
+- black hole
+- neutron star
+- gravitational wave
+- machine learning
+bib_file: data/references.bib
+llm:
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY
+  model: deepseek-chat
+output:
+  bibtex_dir: ./output/bibtex
+  digest_dir: ./output/digests
+email:
+  enabled: true
+  smtp_server: cstnet.mail.cn
+  smtp_port: 587
+  use_ssl: false
+  sender: rzjiang@pmo.ac.cn
+  recipient: rzjiang@pmo.ac.cn
+  password_env: EMAIL_APP_PASSWORD
+filter:
+  max_candidates_for_llm: 80
+  score_threshold: 7
+  fetch_days: 3
