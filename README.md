@@ -23,11 +23,11 @@ Automatically fetches, filters, and ranks daily arXiv papers based on your resea
 The `.app` bundle is not included in the repo. Build it first:
 
 ```bash
-./build_app.sh
+./build_app.sh   # Creates .venv, installs deps, builds .app
 ```
 
 Then double-click `ArXivDailyDigest.app` — your browser opens automatically:
-- First run: Auto-creates virtual environment, installs dependencies, shows setup wizard
+- First run: Shows the setup wizard
 - Subsequent runs: Displays the latest paper digest directly
 
 ### Option 2: Command Line

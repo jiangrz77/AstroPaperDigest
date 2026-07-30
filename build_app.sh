@@ -79,8 +79,8 @@ cd "$PROJECT_DIR"
 if [ ! -f "$PROJECT_DIR/.venv/bin/python3" ]; then
     osascript -e 'display notification "First run: setting up Python environment..." with title "ArXivDailyDigest"'
     python3 -m venv "$PROJECT_DIR/.venv"
-    "$PROJECT_DIR/.venv/bin/pip" install --upgrade pip -q 2>/dev/null
-    "$PROJECT_DIR/.venv/bin/pip" install -r "$PROJECT_DIR/requirements.txt" -q 2>/dev/null
+    "$PROJECT_DIR/.venv/bin/pip" install --upgrade pip -q
+    "$PROJECT_DIR/.venv/bin/pip" install -r "$PROJECT_DIR/requirements.txt" -q
 fi
 
 if [ -f "$PROJECT_DIR/.venv/bin/python3" ]; then
@@ -185,6 +185,26 @@ else
     echo "WARNING: No icon assets found, app will use default icon."
 fi
 
+# 4. Python environment
+echo "Setting up Python environment..."
+if ! command -v python3 &>/dev/null; then
+    echo "ERROR: python3 not found. Install Python 3.9+ first."
+    echo "  brew install python3"
+    exit 1
+fi
+
+if [ ! -f ".venv/bin/python3" ] || ! .venv/bin/python3 -c "import sys; assert sys.prefix != sys.base_prefix" 2>/dev/null; then
+    rm -rf .venv
+    python3 -m venv .venv
+fi
+
+echo "Installing dependencies..."
+if ! .venv/bin/python3 -m pip install -r requirements.txt -q; then
+    echo "ERROR: Failed to install dependencies."
+    exit 1
+fi
+
 echo ""
 echo "Done! Created: $APP_DIR"
+echo "Python venv ready at .venv/"
 echo "Double-click $APP_DIR to launch ArXivDailyDigest."
