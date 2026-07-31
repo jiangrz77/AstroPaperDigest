@@ -2,7 +2,6 @@
 
 import re
 from collections import Counter
-from pathlib import Path
 
 import bibtexparser
 
@@ -122,6 +121,28 @@ def build_profile(bib_path: str) -> dict:
         "topic_phrases": extract_topic_phrases(entries),
         "recent_titles": extract_recent_titles(entries),
         "all_entries": entries,
+    }
+
+
+def build_profile_from_config(config: dict) -> dict:
+    """Build an interest profile from config keywords and categories (no bib file needed).
+
+    Used as fallback when no BibTeX collection is available.
+    """
+    categories = Counter()
+    for cat in config.get("arxiv_categories", []):
+        categories[cat] = 1
+
+    keywords = Counter()
+    for kw in config.get("keywords", []):
+        keywords[kw] = 1
+
+    return {
+        "categories": categories,
+        "keywords": keywords,
+        "topic_phrases": Counter(),
+        "recent_titles": [],
+        "all_entries": [],
     }
 
 

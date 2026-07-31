@@ -1,7 +1,8 @@
 """Parse markdown digest files into structured paper entries."""
 
+import glob
+import os
 import re
-from datetime import date
 
 
 def parse_digest(digest_path: str) -> dict:
@@ -22,7 +23,7 @@ def parse_digest(digest_path: str) -> dict:
     }
     
     # Extract header info
-    date_match = re.search(r"# (?:ArXivDailyDigest|Arxiv Daily Digest) - (\d{4}-\d{2}-\d{2})", content)
+    date_match = re.search(r"# (?:AstroPaperDigest|Arxiv Daily Digest) - (\d{4}-\d{2}-\d{2})", content)
     if date_match:
         result["date"] = date_match.group(1)
     
@@ -130,9 +131,6 @@ def _parse_single_paper(block: str) -> dict:
 
 def get_latest_digest_path(digest_dir: str = "./output/digests") -> str:
     """Find the most recent digest file."""
-    import os
-    import glob
-    
     pattern = os.path.join(digest_dir, "digest_*.md")
     files = glob.glob(pattern)
     if not files:
@@ -142,16 +140,12 @@ def get_latest_digest_path(digest_dir: str = "./output/digests") -> str:
 
 def get_digest_path_for_date(date_str: str, digest_dir: str = "./output/digests") -> str:
     """Get digest file path for a specific date (YYYY-MM-DD). Returns '' if not found."""
-    import os
     path = os.path.join(digest_dir, f"digest_{date_str}.md")
     return path if os.path.exists(path) else ""
 
 
 def get_available_dates(digest_dir: str = "./output/digests") -> list:
     """Return sorted list of dates that have digest files (newest first)."""
-    import os
-    import glob
-    
     pattern = os.path.join(digest_dir, "digest_*.md")
     dates = []
     for f in glob.glob(pattern):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ArXivDailyDigest - Flask web interface with taste feedback.
+"""AstroPaperDigest - Flask web interface with taste feedback.
 
 Flow: .app launches this -> browser opens immediately with status page ->
 pipeline runs in background -> page auto-updates when done.
@@ -8,14 +8,18 @@ pipeline runs in background -> page auto-updates when done.
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 import webbrowser
 from datetime import date
 from pathlib import Path
-from threading import Thread, Timer
+from queue import Empty, Queue
+from threading import Lock, Thread, Timer
 
-from flask import Flask, render_template_string, request, jsonify, redirect
+from flask import Flask, abort, jsonify, redirect, render_template_string, request
+from werkzeug.utils import secure_filename
 
 # Ensure working directory is the project root (for .app launches)
 _PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -33,6 +37,91 @@ app = Flask(__name__)
 _current_digest = None
 _pipeline_status = "idle"  # idle | running | done | error
 _pipeline_message = ""
+_pipeline_process = None
+_pipeline_lock = Lock()
+_browser_clients = {}
+_browser_clients_lock = Lock()
+_browser_check_timer = None
+
+_BROWSER_CLIENT_TIMEOUT = 45.0
+_BROWSER_CLOSE_GRACE = 2.0
+_BROWSER_LIFECYCLE_SCRIPT = """
+<script>
+(() => {
+  const storageKey = "astroPaperDigestClientId";
+  let clientId;
+  try {
+    clientId = sessionStorage.getItem(storageKey);
+    if (!clientId) {
+      clientId = crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random()}`;
+      sessionStorage.setItem(storageKey, clientId);
+    }
+  } catch (_) {
+    clientId = `${Date.now()}-${Math.random()}`;
+  }
+
+  const endpoint = (action) =>
+    `/client/${action}?id=${encodeURIComponent(clientId)}`;
+  const heartbeat = () => fetch(endpoint("heartbeat"), {
+    method: "POST",
+    cache: "no-store",
+    keepalive: true
+  }).catch(() => {});
+
+  heartbeat();
+  const heartbeatTimer = setInterval(heartbeat, 10000);
+  addEventListener("pagehide", () => {
+    clearInterval(heartbeatTimer);
+    navigator.sendBeacon(endpoint("close"));
+  }, { once: true });
+})();
+</script>
+"""
+
+
+def _terminate_server():
+    """Terminate Flask so the launcher exits and releases its port."""
+    process = _pipeline_process
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+def _schedule_browser_check_locked(delay: float):
+    global _browser_check_timer
+    if _browser_check_timer is not None:
+        _browser_check_timer.cancel()
+    _browser_check_timer = Timer(delay, _check_browser_clients)
+    _browser_check_timer.daemon = True
+    _browser_check_timer.start()
+
+
+def _check_browser_clients():
+    """Stop the server after all browser tabs close or disappear."""
+    global _browser_check_timer
+    with _browser_clients_lock:
+        cutoff = time.monotonic() - _BROWSER_CLIENT_TIMEOUT
+        stale_ids = [
+            client_id
+            for client_id, last_seen in _browser_clients.items()
+            if last_seen < cutoff
+        ]
+        for client_id in stale_ids:
+            _browser_clients.pop(client_id, None)
+
+        if _browser_clients:
+            _schedule_browser_check_locked(_BROWSER_CLIENT_TIMEOUT)
+            return
+        _browser_check_timer = None
+
+    _terminate_server()
 
 
 def _needs_setup():
@@ -43,8 +132,55 @@ def _needs_setup():
 @app.before_request
 def check_setup():
     """Redirect to setup page if first-time user."""
-    if _needs_setup() and request.path != "/setup" and not request.path.startswith("/static"):
+    if (
+        _needs_setup()
+        and request.path != "/setup"
+        and not request.path.startswith(("/static", "/client/"))
+    ):
         return redirect("/setup")
+
+
+@app.after_request
+def add_browser_lifecycle(response):
+    """Attach lifecycle tracking to every rendered browser page."""
+    if response.mimetype == "text/html":
+        content = response.get_data(as_text=True)
+        if "</body>" in content:
+            response.set_data(
+                content.replace(
+                    "</body>",
+                    f"{_BROWSER_LIFECYCLE_SCRIPT}</body>",
+                    1,
+                )
+            )
+    return response
+
+
+@app.route("/client/heartbeat", methods=["POST"])
+def browser_heartbeat():
+    client_id = request.args.get("id", "")
+    if not client_id:
+        return "", 400
+
+    with _browser_clients_lock:
+        _browser_clients[client_id] = time.monotonic()
+        _schedule_browser_check_locked(_BROWSER_CLIENT_TIMEOUT)
+    return "", 204
+
+
+@app.route("/client/close", methods=["POST"])
+def browser_close():
+    client_id = request.args.get("id", "")
+    if client_id:
+        with _browser_clients_lock:
+            _browser_clients.pop(client_id, None)
+            delay = (
+                _BROWSER_CLIENT_TIMEOUT
+                if _browser_clients
+                else _BROWSER_CLOSE_GRACE
+            )
+            _schedule_browser_check_locked(delay)
+    return "", 204
 
 
 def load_preferences() -> dict:
@@ -85,15 +221,90 @@ def save_feedback(feedback: list):
         json.dump(feedback, f, indent=2, ensure_ascii=False)
 
 
+def _pipeline_progress_message(line: str) -> str:
+    """Convert CLI output into a concise browser status message."""
+    line = line.strip()
+    if not line:
+        return ""
+    if line.startswith("["):
+        return line
+    if line.startswith("Ranking batch"):
+        return f"AI ranking: {line.lower()}"
+    if line.startswith(("Fetched ", "Category filter:", "Keyword filter:")):
+        return line
+    if line.startswith("Sending email"):
+        return "Sending email notification..."
+    if "before retry" in line or "rate limit" in line.lower():
+        return line
+    return ""
+
+
+def _stream_pipeline(cmd: list[str], timeout: int = 900) -> tuple[int, str]:
+    """Run the CLI while streaming progress instead of buffering silently."""
+    global _pipeline_message, _pipeline_process
+
+    output_lines = []
+    output_queue = Queue()
+    environment = os.environ.copy()
+    environment["PYTHONUNBUFFERED"] = "1"
+    _pipeline_process = subprocess.Popen(
+        cmd,
+        cwd=str(_PROJECT_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=environment,
+    )
+
+    def read_output():
+        assert _pipeline_process.stdout is not None
+        for output_line in _pipeline_process.stdout:
+            output_queue.put(output_line)
+        output_queue.put(None)
+
+    Thread(target=read_output, daemon=True).start()
+    deadline = time.monotonic() + timeout
+
+    try:
+        while True:
+            if time.monotonic() >= deadline:
+                _pipeline_process.terminate()
+                try:
+                    _pipeline_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _pipeline_process.kill()
+                raise subprocess.TimeoutExpired(cmd, timeout)
+
+            try:
+                output_line = output_queue.get(timeout=0.5)
+            except Empty:
+                if _pipeline_process.poll() is not None:
+                    break
+                continue
+
+            if output_line is None:
+                break
+
+            output_lines.append(output_line)
+            progress = _pipeline_progress_message(output_line)
+            if progress:
+                _pipeline_message = progress
+
+        return _pipeline_process.wait(), "".join(output_lines)
+    finally:
+        _pipeline_process = None
+
+
 def run_pipeline(include_cross: bool = True, include_replacements: bool = True, target_date: str = ""):
     """Run the recommendation pipeline in a background thread."""
     global _current_digest, _pipeline_status, _pipeline_message
     _pipeline_status = "running"
-    _pipeline_message = "Fetching and ranking papers..."
+    _pipeline_message = "[1/5] Starting pipeline..."
 
     try:
         # Build command with preferences
-        cmd = [sys.executable, "main.py"]
+        cmd = [sys.executable, "-u", "main.py"]
         if not include_cross:
             cmd.append("--no-cross")
         if not include_replacements:
@@ -101,15 +312,8 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
         if target_date:
             cmd.extend(["--target-date", target_date])
         
-        result = subprocess.run(
-            cmd,
-            cwd=str(_PROJECT_DIR),
-            capture_output=True,
-            text=True,
-            timeout=900,  # 15 minutes to accommodate retry waits
-        )
-        if result.returncode == 0:
-            stdout = result.stdout or ""
+        return_code, stdout = _stream_pipeline(cmd)
+        if return_code == 0:
             digest_path = get_latest_digest_path()
             if digest_path:
                 _current_digest = parse_digest(digest_path)
@@ -129,24 +333,47 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
         else:
             _pipeline_status = "error"
             # Show a cleaner error message
-            stderr = result.stderr or ""
-            stdout = result.stdout or ""
-            if "HTTPError" in stderr and "429" in stderr:
+            if "HTTPError" in stdout and "429" in stdout:
                 _pipeline_message = (
-                    "Arxiv API rate limit exceeded (HTTP 429).\n\n"
-                    "This happens when too many requests are sent in a short time.\n"
-                    "Please wait a few minutes and try again.\n\n"
-                    "Tip: You can uncheck 'Cross-listed' or 'Replacements' "
-                    "to fetch fewer papers."
+                    "arXiv API rate limit exceeded (HTTP 429).\n\n"
+                    "To avoid adding more load, AstroPaperDigest stopped "
+                    "without automatic retries.\n\n"
+                    "Please wait at least five minutes before running again. "
+                    "Repeatedly clicking Re-run will extend the problem."
                 )
             else:
-                _pipeline_message = (stderr or stdout or "Unknown error")[-800:]
+                _pipeline_message = (stdout or "Unknown error")[-800:]
     except subprocess.TimeoutExpired:
         _pipeline_status = "error"
         _pipeline_message = "Pipeline timed out (>15 minutes)."
     except Exception as e:
         _pipeline_status = "error"
         _pipeline_message = str(e)
+
+
+def _start_pipeline(
+    include_cross: bool = True,
+    include_replacements: bool = True,
+    target_date: str = "",
+) -> bool:
+    """Start at most one pipeline process."""
+    global _pipeline_status, _pipeline_message
+
+    with _pipeline_lock:
+        if _pipeline_status == "running":
+            return False
+        _pipeline_status = "running"
+        _pipeline_message = "[1/5] Starting pipeline..."
+        Thread(
+            target=run_pipeline,
+            kwargs={
+                "include_cross": include_cross,
+                "include_replacements": include_replacements,
+                "target_date": target_date,
+            },
+            daemon=True,
+        ).start()
+    return True
 
 
 # --- HTML Templates ---
@@ -156,7 +383,7 @@ SETUP_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ArXivDailyDigest - Setup</title>
+<title>AstroPaperDigest - Setup</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333}
@@ -184,7 +411,7 @@ textarea{height:80px;resize:vertical}
 </head>
 <body>
 <div class="header">
-  <h1>ArXivDailyDigest</h1>
+  <h1>AstroPaperDigest</h1>
   <p>Let's set up your personalized paper recommendation system</p>
 </div>
 <div class="container">
@@ -216,12 +443,12 @@ textarea{height:80px;resize:vertical}
     <div id="quick-mode">
       <label>Arxiv Categories</label>
       <div class="checkbox-grid">
-        <label><input type="checkbox" name="categories" value="astro-ph.GA" checked> astro-ph.GA</label>
-        <label><input type="checkbox" name="categories" value="astro-ph.SR" checked> astro-ph.SR</label>
-        <label><input type="checkbox" name="categories" value="astro-ph.HE"> astro-ph.HE</label>
-        <label><input type="checkbox" name="categories" value="astro-ph.CO"> astro-ph.CO</label>
-        <label><input type="checkbox" name="categories" value="astro-ph.IM"> astro-ph.IM</label>
-        <label><input type="checkbox" name="categories" value="astro-ph.EP"> astro-ph.EP</label>
+        <label><input type="checkbox" name="categories" value="astro-ph.GA" {% if 'astro-ph.GA' in cur_categories %}checked{% endif %}> astro-ph.GA</label>
+        <label><input type="checkbox" name="categories" value="astro-ph.SR" {% if 'astro-ph.SR' in cur_categories %}checked{% endif %}> astro-ph.SR</label>
+        <label><input type="checkbox" name="categories" value="astro-ph.HE" {% if 'astro-ph.HE' in cur_categories %}checked{% endif %}> astro-ph.HE</label>
+        <label><input type="checkbox" name="categories" value="astro-ph.CO" {% if 'astro-ph.CO' in cur_categories %}checked{% endif %}> astro-ph.CO</label>
+        <label><input type="checkbox" name="categories" value="astro-ph.IM" {% if 'astro-ph.IM' in cur_categories %}checked{% endif %}> astro-ph.IM</label>
+        <label><input type="checkbox" name="categories" value="astro-ph.EP" {% if 'astro-ph.EP' in cur_categories %}checked{% endif %}> astro-ph.EP</label>
       </div>
       <label for="keywords">Keywords (comma-separated)</label>
       <textarea id="keywords" name="keywords" placeholder="e.g. first stars, chemical evolution, supernova, stellar abundances">{{ cur_keywords or '' }}</textarea>
@@ -291,7 +518,7 @@ STATUS_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ArXivDailyDigest</title>
+<title>AstroPaperDigest</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333}
@@ -320,7 +547,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="sticky-wrapper">
 <div class="header">
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-    <h1 style="margin:0;font-size:20px"><img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='20' height='20'%3E%3Cpath fill='%23fff' d='M19 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h13c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 14H7v-2h11v2zm0-4H7v-2h11v2zm0-4H7V6h11v2z'/%3E%3C/svg%3E" style="vertical-align:middle;margin-right:6px" width="20" height="20">ArXivDailyDigest</h1>
+    <h1 style="margin:0;font-size:20px"><img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='20' height='20'%3E%3Cpath fill='%23fff' d='M19 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h13c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 14H7v-2h11v2zm0-4H7v-2h11v2zm0-4H7V6h11v2z'/%3E%3C/svg%3E" style="vertical-align:middle;margin-right:6px" width="20" height="20">AstroPaperDigest</h1>
     <div style="display:flex;align-items:center;gap:8px">
       <button class="date-arrow" onclick="shiftDate(-1)" style="cursor:pointer;opacity:1">&larr;</button>
       <span class="date-display" id="date-label" onclick="openDatePicker()" style="cursor:pointer">{{ display_date }}</span>
@@ -332,7 +559,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 <div class="toolbar">
   <button class="btn-refresh" disabled style="opacity:.6" title="Running...">&#x21bb;</button>
-  <span id="stats" style="font-size:13px;color:#666">Fetching and ranking papers...</span>
   <button class="btn-nav" style="opacity:.5">Highly Relevant (...)</button>
   <button class="btn-nav" style="opacity:.5">Possibly Relevant (...)</button>
   <button class="btn-nav" style="opacity:.5">Marginal (...)</button>
@@ -392,7 +618,6 @@ function goToToday() {
 function poll() {
   fetch('/status').then(r=>r.json()).then(d=>{
     document.getElementById('msg').textContent = d.message;
-    document.getElementById('stats').textContent = d.message;
     if(d.status === 'done') {
       window.location.href = '/digest/{{ display_date }}';
     } else if(d.status === 'error') {
@@ -402,7 +627,6 @@ function poll() {
       document.getElementById('retry').style.display = 'inline-block';
       document.getElementById('back').style.display = 'inline-block';
       document.getElementById('msg').textContent = 'Pipeline failed.';
-      document.getElementById('stats').textContent = 'Pipeline failed.';
     } else {
       setTimeout(poll, 2000);
     }
@@ -418,7 +642,7 @@ DIGEST_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ArXivDailyDigest - {{ digest.date }}</title>
+<title>AstroPaperDigest - {{ digest.date }}</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333}
@@ -470,7 +694,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="sticky-wrapper">
 <div class="header">
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-    <h1 style="margin:0;font-size:20px"><img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='20' height='20'%3E%3Cpath fill='%23fff' d='M19 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h13c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 14H7v-2h11v2zm0-4H7v-2h11v2zm0-4H7V6h11v2z'/%3E%3C/svg%3E" style="vertical-align:middle;margin-right:6px" width="20" height="20">ArXivDailyDigest</h1>
+    <h1 style="margin:0;font-size:20px"><img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='20' height='20'%3E%3Cpath fill='%23fff' d='M19 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h13c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 14H7v-2h11v2zm0-4H7v-2h11v2zm0-4H7V6h11v2z'/%3E%3C/svg%3E" style="vertical-align:middle;margin-right:6px" width="20" height="20">AstroPaperDigest</h1>
     <div style="display:flex;align-items:center;gap:8px">
       <button class="date-arrow" onclick="shiftDate(-1)">&larr;</button>
       <span class="date-display" id="date-label" onclick="openDatePicker()">{{ digest.date }}</span>
@@ -680,7 +904,7 @@ NO_DIGEST_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ArXivDailyDigest - {{ selected_date }}</title>
+<title>AstroPaperDigest - {{ selected_date }}</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333}
@@ -708,7 +932,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="sticky-wrapper">
 <div class="header">
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-    <h1 style="margin:0;font-size:20px"><img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='20' height='20'%3E%3Cpath fill='%23fff' d='M19 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h13c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 14H7v-2h11v2zm0-4H7v-2h11v2zm0-4H7V6h11v2z'/%3E%3C/svg%3E" style="vertical-align:middle;margin-right:6px" width="20" height="20">ArXivDailyDigest</h1>
+    <h1 style="margin:0;font-size:20px"><img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='20' height='20'%3E%3Cpath fill='%23fff' d='M19 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h13c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 14H7v-2h11v2zm0-4H7v-2h11v2zm0-4H7V6h11v2z'/%3E%3C/svg%3E" style="vertical-align:middle;margin-right:6px" width="20" height="20">AstroPaperDigest</h1>
     <div style="display:flex;align-items:center;gap:8px">
       <button class="date-arrow" onclick="shiftDate(-1)">&larr;</button>
       <span class="date-display" id="date-label" onclick="openDatePicker()">{{ selected_date }}</span>
@@ -788,8 +1012,7 @@ _ARXIV_HOLIDAYS_2026 = {
 
 def _is_arxiv_update_day(date_str: str) -> bool:
     """Check if date is a valid arxiv update day (weekday + not holiday)."""
-    from datetime import date as date_cls
-    d = date_cls.fromisoformat(date_str)
+    d = date.fromisoformat(date_str)
     if d.weekday() >= 5:  # Sat/Sun
         return False
     if date_str in _ARXIV_HOLIDAYS_2026:
@@ -883,7 +1106,7 @@ def setup_submit():
     email_recipient = request.form.get("email_recipient", "").strip()
     smtp_server = request.form.get("smtp_server", "").strip()
     smtp_protocol = request.form.get("smtp_protocol", "starttls")
-    smtp_port = request.form.get("smtp_port", "").strip()
+    smtp_port_value = request.form.get("smtp_port", "").strip()
     email_password = request.form.get("email_password", "").strip()
 
     # Determine API key env var name and base URL
@@ -896,15 +1119,30 @@ def setup_submit():
     else:
         api_key_env = "CUSTOM_API_KEY"
 
+    try:
+        smtp_port = int(smtp_port_value) if smtp_port_value else (
+            465 if smtp_protocol == "ssl" else 587
+        )
+    except ValueError:
+        abort(400, "SMTP port must be an integer.")
+    if not 1 <= smtp_port <= 65535:
+        abort(400, "SMTP port must be between 1 and 65535.")
+
     # Write .env file
     env_path = os.path.join(_PROJECT_DIR, ".env")
+    env_values = {
+        api_key_env: api_key,
+        "EMAIL_APP_PASSWORD": email_password,
+        "EMAIL_SENDER": email_sender,
+        "EMAIL_RECIPIENT": email_recipient or email_sender,
+        "SMTP_SERVER": smtp_server,
+        "SMTP_PORT": str(smtp_port),
+    }
     with open(env_path, "w", encoding="utf-8") as f:
-        f.write(f'{api_key_env}="{api_key}"\n')
-        f.write(f'EMAIL_APP_PASSWORD="{email_password}"\n')
-        f.write(f'EMAIL_SENDER="{email_sender}"\n')
-        f.write(f'EMAIL_RECIPIENT="{email_recipient or email_sender}"\n')
-        f.write(f'SMTP_SERVER="{smtp_server}"\n')
-        f.write(f'SMTP_PORT="{smtp_port or ("465" if smtp_protocol == "ssl" else "587")}"\n')
+        for key, value in env_values.items():
+            escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+            f.write(f'{key}="{escaped}"\n')
+    os.chmod(env_path, 0o600)
 
     # Load existing config and update
     config_path = os.path.join(_PROJECT_DIR, "config.yaml")
@@ -929,8 +1167,11 @@ def setup_submit():
         if bib_file and bib_file.filename:
             data_dir = os.path.join(_PROJECT_DIR, "data")
             os.makedirs(data_dir, exist_ok=True)
-            bib_file.save(os.path.join(data_dir, bib_file.filename))
-            config["bib_file"] = f"data/{bib_file.filename}"
+            filename = secure_filename(bib_file.filename)
+            if not filename:
+                abort(400, "Invalid BibTeX filename.")
+            bib_file.save(os.path.join(data_dir, filename))
+            config["bib_file"] = f"data/{filename}"
         elif bib_path:
             config["bib_file"] = bib_path
 
@@ -941,7 +1182,7 @@ def setup_submit():
         config["email"]["recipient"] = email_recipient or email_sender
         config["email"]["smtp_server"] = smtp_server
         config["email"]["use_ssl"] = (smtp_protocol == "ssl")
-        config["email"]["smtp_port"] = int(smtp_port) if smtp_port else (465 if smtp_protocol == "ssl" else 587)
+        config["email"]["smtp_port"] = smtp_port
         config["email"]["password_env"] = "EMAIL_APP_PASSWORD"
 
     # Write updated config
@@ -1001,6 +1242,11 @@ def digest_page():
 @app.route("/digest/<date_str>")
 def digest_by_date(date_str):
     """Show digest for a specific date, or auto-run / show no-update."""
+    try:
+        date.fromisoformat(date_str)
+    except ValueError:
+        abort(404)
+
     digest_path = get_digest_path_for_date(date_str)
     if digest_path:
         digest = parse_digest(digest_path)
@@ -1019,18 +1265,12 @@ def digest_by_date(date_str):
             is_update_day=_is_arxiv_update_day(date_str)
         )
     # Auto-run pipeline if navigating to today and no digest exists yet
-    global _pipeline_status
     if date_str == today_str:
-        if _pipeline_status != "running":
-            prefs = load_preferences()
-            Thread(
-                target=run_pipeline,
-                kwargs={
-                    "include_cross": prefs.get("include_cross", True),
-                    "include_replacements": prefs.get("include_replacements", True),
-                },
-                daemon=True
-            ).start()
+        prefs = load_preferences()
+        _start_pipeline(
+            include_cross=prefs.get("include_cross", True),
+            include_replacements=prefs.get("include_replacements", True),
+        )
         return render_template_string(STATUS_PAGE, display_date=date_str, today_str=today_str)
     return render_template_string(
         NO_DIGEST_TEMPLATE,
@@ -1045,25 +1285,28 @@ def digest_by_date(date_str):
 @app.route("/status")
 def status():
     """JSON status endpoint for polling."""
-    return jsonify({"status": _pipeline_status, "message": _pipeline_message})
+    return jsonify({
+        "app": "AstroPaperDigest",
+        "status": _pipeline_status,
+        "message": _pipeline_message,
+    })
 
 
 @app.route("/run")
 def run():
     """Trigger a pipeline run and show status page."""
-    global _pipeline_status
     target_date = request.args.get("date", "")
-    if _pipeline_status != "running":
-        prefs = load_preferences()
-        Thread(
-            target=run_pipeline,
-            kwargs={
-                "include_cross": prefs.get("include_cross", True),
-                "include_replacements": prefs.get("include_replacements", True),
-                "target_date": target_date,
-            },
-            daemon=True
-        ).start()
+    if target_date:
+        try:
+            date.fromisoformat(target_date)
+        except ValueError:
+            abort(400, "Date must use YYYY-MM-DD format.")
+    prefs = load_preferences()
+    _start_pipeline(
+        include_cross=prefs.get("include_cross", True),
+        include_replacements=prefs.get("include_replacements", True),
+        target_date=target_date,
+    )
     return render_template_string(STATUS_PAGE, display_date=target_date or date.today().isoformat(), today_str=date.today().isoformat())
 
 
@@ -1074,13 +1317,19 @@ def get_preferences():
 
 @app.route("/preferences", methods=["POST"])
 def post_preferences():
-    data = request.json
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        abort(400, "Expected a JSON object.")
     prefs = load_preferences()
-    if "include_cross" in data:
+    if isinstance(data.get("include_cross"), bool):
         prefs["include_cross"] = data["include_cross"]
-    if "include_replacements" in data:
+    if isinstance(data.get("include_replacements"), bool):
         prefs["include_replacements"] = data["include_replacements"]
     if "last_viewed_date" in data:
+        try:
+            date.fromisoformat(data["last_viewed_date"])
+        except (TypeError, ValueError):
+            abort(400, "Date must use YYYY-MM-DD format.")
         prefs["last_viewed_date"] = data["last_viewed_date"]
     save_preferences(prefs)
     return jsonify({"ok": True, "preferences": prefs})
@@ -1093,9 +1342,15 @@ def get_feedback():
 
 @app.route("/feedback", methods=["POST"])
 def post_feedback():
-    data = request.json
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        abort(400, "Expected a JSON object.")
     paper_id = data.get("paper_id", "")
     action = data.get("action", "")
+    if not isinstance(paper_id, str) or not paper_id:
+        abort(400, "paper_id is required.")
+    if action not in {"overrated", "underrated", "cancel"}:
+        abort(400, "Invalid feedback action.")
 
     feedback = load_feedback()
     feedback = [fb for fb in feedback if fb.get("paper_id") != paper_id]
@@ -1128,9 +1383,9 @@ def open_browser(port: int = 5123):
 
 
 def main():
-    global _current_digest, _pipeline_status
+    global _current_digest, _pipeline_message, _pipeline_status
 
-    parser = argparse.ArgumentParser(description="ArXivDailyDigest Web Viewer")
+    parser = argparse.ArgumentParser(description="AstroPaperDigest Web Viewer")
     parser.add_argument("--port", type=int, default=5123, help="Port (default: 5123)")
     parser.add_argument("--no-browser", action="store_true", help="Don't auto-open browser")
     parser.add_argument("--no-run", action="store_true", help="Don't auto-start pipeline")
@@ -1147,16 +1402,11 @@ def main():
     has_today = os.path.exists(today_digest)
 
     if not args.no_run and not has_today:
-        _pipeline_status = "running"
         prefs = load_preferences()
-        Thread(
-            target=run_pipeline,
-            kwargs={
-                "include_cross": prefs.get("include_cross", True),
-                "include_replacements": prefs.get("include_replacements", True),
-            },
-            daemon=True
-        ).start()
+        _start_pipeline(
+            include_cross=prefs.get("include_cross", True),
+            include_replacements=prefs.get("include_replacements", True),
+        )
     else:
         _pipeline_status = "done"
         _pipeline_message = "Showing existing digest."

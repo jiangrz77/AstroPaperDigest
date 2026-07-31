@@ -8,7 +8,7 @@ import tempfile
 from unittest.mock import MagicMock, patch
 
 # Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.profile import build_profile, profile_to_prompt_text
 from src.fetch_arxiv import fetch_papers
@@ -288,9 +288,15 @@ def test_output_generation():
     
     # Test BibTeX output
     with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as bib_dir:
-        bib_path = write_bibtex(papers, bib_dir, threshold=7)
+        bib_path = write_bibtex(
+            papers,
+            bib_dir,
+            threshold=7,
+            output_date="2026-07-15",
+        )
         
         assert bib_path, "Should return a path"
+        assert bib_path.endswith("recommendations_2026-07-15.bib")
         with open(bib_path) as f:
             content = f.read()
         
@@ -301,7 +307,12 @@ def test_output_generation():
         assert r"\%" in content, "Should escape % in BibTeX"
         
         # Test dedup
-        write_bibtex(papers, bib_dir, threshold=7)
+        write_bibtex(
+            papers,
+            bib_dir,
+            threshold=7,
+            output_date="2026-07-15",
+        )
         with open(bib_path) as f:
             content2 = f.read()
         assert content2.count("@misc{2607_111") == 1, "Should not duplicate entry"

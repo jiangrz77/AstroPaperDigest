@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Arxiv Daily Paper Recommender - CLI entry point.
+"""Astro Paper Digest - CLI entry point.
 
 Fetches recent arxiv papers, filters by category/keyword, ranks with LLM,
 and outputs BibTeX + Markdown digest.
@@ -7,7 +7,6 @@ and outputs BibTeX + Markdown digest.
 
 import argparse
 import os
-import sys
 from datetime import date
 from pathlib import Path
 
@@ -20,7 +19,7 @@ _PROJECT_DIR = Path(__file__).resolve().parent
 load_dotenv(_PROJECT_DIR / ".env")
 os.chdir(_PROJECT_DIR)
 
-from src.profile import build_profile
+from src.profile import build_profile, build_profile_from_config
 from src.fetch_arxiv import fetch_papers
 from src.filter import filter_papers
 from src.ranker import rank_papers
@@ -40,7 +39,7 @@ def _write_empty_digest(digest_dir: str, reason: str, digest_date: str = None):
     os.makedirs(digest_dir, exist_ok=True)
     d = digest_date or date.today().isoformat()
     path = os.path.join(digest_dir, f"digest_{d}.md")
-    content = f"""# ArXivDailyDigest - {d}
+    content = f"""# AstroPaperDigest - {d}
 
 **Total papers reviewed:** 0
 **Highly relevant (score >= 7):** 0
@@ -53,18 +52,12 @@ def _write_empty_digest(digest_dir: str, reason: str, digest_date: str = None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Arxiv Daily Paper Recommender"
+        description="Astro Paper Digest"
     )
     parser.add_argument(
         "--config",
         default="config.yaml",
         help="Path to config file (default: config.yaml)"
-    )
-    parser.add_argument(
-        "--days",
-        type=int,
-        default=None,
-        help="Number of past days to fetch papers (overrides config)"
     )
     parser.add_argument(
         "--threshold",
@@ -100,7 +93,7 @@ def main():
     parser.add_argument(
         "--target-date",
         default=None,
-        help="Target date for digest (overrides derived arxiv date)"
+        help="Target local date for digest (YYYY-MM-DD, defaults to today)"
     )
     
     args = parser.parse_args()
@@ -111,21 +104,23 @@ def main():
     # Override config with CLI args
     filter_cfg = config.get("filter", {})
     output_cfg = config.get("output", {})
-    fetch_days = args.days if args.days is not None else filter_cfg.get("fetch_days", 1)
     threshold = args.threshold if args.threshold is not None else filter_cfg.get("score_threshold", 7)
     
-    print("=== Arxiv Daily Paper Recommender ===\n")
+    print("=== Astro Paper Digest ===\n")
     
     # Step 1: Build interest profile
     print("[1/5] Building interest profile...")
-    bib_path = config.get("bib_file", "ArxivDailyCollection.bib")
-    if not os.path.exists(bib_path):
-        print(f"Error: Bib file not found: {bib_path}")
-        sys.exit(1)
-    
-    profile = build_profile(bib_path)
-    print(f"  Parsed {len(profile['all_entries'])} entries from {bib_path}")
-    print(f"  Top categories: {', '.join(f'{c}({n})' for c, n in profile['categories'].most_common(5))}")
+    bib_path = config.get("bib_file", "")
+    if bib_path and os.path.exists(bib_path):
+        profile = build_profile(bib_path)
+        print(f"  Parsed {len(profile['all_entries'])} entries from {bib_path}")
+        print(f"  Top categories: {', '.join(f'{c}({n})' for c, n in profile['categories'].most_common(5))}")
+    else:
+        if bib_path:
+            print(f"  Bib file not found: {bib_path}")
+        print("  Using keywords from config.yaml as interest profile")
+        profile = build_profile_from_config(config)
+        print(f"  Keywords: {len(profile['keywords'])} | Categories: {len(profile['categories'])}")
     
     if args.update_profile:
         print("\n=== Interest Profile Summary ===")
@@ -133,31 +128,29 @@ def main():
         print(profile_to_prompt_text(profile))
         return
     
-    # Step 2: Fetch papers from arxiv
-    print(f"\n[2/5] Fetching papers from arxiv (last {fetch_days} day(s))...")
-    categories = config.get("arxiv_categories", ["astro-ph.GA"])
+    # Determine digest date in the user's local timezone
+    arxiv_date = args.target_date or date.today().isoformat()
+    print(f"  Digest date: {arxiv_date}")
+
+    # Step 2: Fetch papers
+    print(f"\n[2/5] Fetching papers...")
+    categories = config.get("arxiv_categories", [
+        "astro-ph.CO",
+        "astro-ph.EP",
+        "astro-ph.GA",
+        "astro-ph.HE",
+        "astro-ph.IM",
+        "astro-ph.SR",
+    ])
     include_cross = not args.no_cross
     include_replacements = not args.no_replacements
     papers = fetch_papers(
-        categories, 
-        days=fetch_days,
+        categories,
+        target_date=arxiv_date,
         include_cross=include_cross,
         include_replacements=include_replacements,
-        target_date=args.target_date,
     )
     print(f"  Fetched {len(papers)} papers")
-    
-    # Determine arxiv update date from papers (latest published date)
-    if papers:
-        arxiv_date = max(p["published"][:10] for p in papers)
-        print(f"  Arxiv update date: {arxiv_date}")
-    else:
-        arxiv_date = date.today().isoformat()
-    
-    # Override with target date if specified
-    if args.target_date:
-        arxiv_date = args.target_date
-        print(f"  Using target date: {arxiv_date}")
     
     # Count paper types
     if papers:
@@ -232,7 +225,12 @@ def main():
     
     # BibTeX output (date-stamped) - only ranked papers above threshold
     bibtex_dir = output_cfg.get("bibtex_dir", "./output/bibtex")
-    bibtex_path = write_bibtex(ranked, bibtex_dir, threshold)
+    bibtex_path = write_bibtex(
+        ranked,
+        bibtex_dir,
+        threshold,
+        output_date=arxiv_date,
+    )
     
     # Markdown digest - ALL papers
     digest_dir = output_cfg.get("digest_dir", "./output/digests")

@@ -3,7 +3,6 @@
 import os
 import re
 from datetime import date
-from pathlib import Path
 
 
 def _escape_bibtex(text: str) -> str:
@@ -56,7 +55,12 @@ def paper_to_bibtex(paper: dict) -> str:
     return bibtex
 
 
-def write_bibtex(papers: list[dict], output_dir: str, threshold: int = 7) -> str:
+def write_bibtex(
+    papers: list[dict],
+    output_dir: str,
+    threshold: int = 7,
+    output_date: str = None,
+) -> str:
     """Write BibTeX entries for papers above the score threshold.
     
     Papers are saved to a date-stamped file: bibtex/recommendations_YYYY-MM-DD.bib
@@ -65,6 +69,7 @@ def write_bibtex(papers: list[dict], output_dir: str, threshold: int = 7) -> str
         papers: ranked list of paper dicts with 'score' field
         output_dir: path to the bibtex output directory
         threshold: minimum score to include
+        output_date: date string (YYYY-MM-DD) for the output filename
 
     Returns:
         path to the written file
@@ -76,10 +81,10 @@ def write_bibtex(papers: list[dict], output_dir: str, threshold: int = 7) -> str
         return ""
     
     os.makedirs(output_dir, exist_ok=True)
-    today = date.today().isoformat()
-    output_path = os.path.join(output_dir, f"recommendations_{today}.bib")
+    d = output_date or date.today().isoformat()
+    output_path = os.path.join(output_dir, f"recommendations_{d}.bib")
     
-    # Check existing entries in today's file for dedup
+    # Check existing entries in the selected date's file for dedup
     existing_ids = set()
     if os.path.exists(output_path):
         with open(output_path, "r", encoding="utf-8") as f:
@@ -101,7 +106,7 @@ def write_bibtex(papers: list[dict], output_dir: str, threshold: int = 7) -> str
             f.write("\n".join(new_entries))
         print(f"  Wrote {len(new_entries)} entries to {output_path}")
     else:
-        print("  All papers already exist in today's BibTeX file.")
+        print("  All papers already exist in the selected date's BibTeX file.")
     
     return output_path
 
@@ -123,7 +128,7 @@ def generate_markdown_digest(
     """
     d = digest_date or date.today().isoformat()
     lines = [
-        f"# ArXivDailyDigest - {d}",
+        f"# AstroPaperDigest - {d}",
         "",
         f"**Total papers reviewed:** {len(papers)}",
         f"**Highly relevant (score >= {threshold}):** {len([p for p in papers if p.get('score', 0) >= threshold])}",

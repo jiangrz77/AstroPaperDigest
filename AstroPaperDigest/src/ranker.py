@@ -12,7 +12,12 @@ FEEDBACK_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__f
 
 def get_client(base_url: str, api_key: str) -> OpenAI:
     """Create an OpenAI-compatible client."""
-    return OpenAI(base_url=base_url, api_key=api_key)
+    return OpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        timeout=60.0,
+        max_retries=1,
+    )
 
 
 def _load_feedback_text() -> str:

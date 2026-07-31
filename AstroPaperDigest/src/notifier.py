@@ -37,6 +37,7 @@ def send_email(
     smtp_server = email_config.get("smtp_server", "smtp.gmail.com")
     smtp_port = email_config.get("smtp_port", 587)
     use_ssl = email_config.get("use_ssl", False)
+    timeout = 30
     
     # Create message
     msg = MIMEMultipart("alternative")
@@ -50,12 +51,20 @@ def send_email(
     try:
         if use_ssl:
             # SSL/TLS connection (port 465)
-            with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
+            with smtplib.SMTP_SSL(
+                smtp_server,
+                smtp_port,
+                timeout=timeout,
+            ) as server:
                 server.login(sender, password)
                 server.sendmail(sender, recipient, msg.as_string())
         else:
             # STARTTLS connection (port 587)
-            with smtplib.SMTP(smtp_server, smtp_port) as server:
+            with smtplib.SMTP(
+                smtp_server,
+                smtp_port,
+                timeout=timeout,
+            ) as server:
                 server.starttls()
                 server.login(sender, password)
                 server.sendmail(sender, recipient, msg.as_string())
@@ -85,5 +94,5 @@ def send_digest_email(
     if date_str is None:
         date_str = date.today().isoformat()
     
-    subject = f"ArXivDailyDigest - {date_str}"
+    subject = f"AstroPaperDigest - {date_str}"
     return send_email(subject, digest_content, email_config)

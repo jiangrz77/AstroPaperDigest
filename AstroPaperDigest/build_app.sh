@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build ArXivDailyDigest.app from source
+# Build AstroPaperDigest.app from source
 # Usage: ./build_app.sh
 # Requires: macOS with iconutil (built-in)
 
@@ -8,13 +8,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Remove macOS quarantine if present (from ZIP downloads)
-xattr -cr . 2>/dev/null || true
+APP_NAME="AstroPaperDigest"
+APP_DIR="../$APP_NAME.app"
 
-APP_NAME="ArXivDailyDigest"
-APP_DIR="$APP_NAME.app"
-
-echo "Building $APP_DIR..."
+echo "Building $APP_NAME.app..."
 
 # Clean previous build
 rm -rf "$APP_DIR"
@@ -30,21 +27,21 @@ cat > "$APP_DIR/Contents/Info.plist" << 'EOF'
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>ArXivDailyDigest</string>
+    <string>AstroPaperDigest</string>
     <key>CFBundleIdentifier</key>
     <string>com.arxivdailydigest.app</string>
     <key>CFBundleName</key>
-    <string>ArXivDailyDigest</string>
+    <string>AstroPaperDigest</string>
     <key>CFBundleDisplayName</key>
-    <string>ArXivDailyDigest</string>
+    <string>AstroPaperDigest</string>
     <key>CFBundleVersion</key>
-    <string>1.0.1</string>
+    <string>1.0.2</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.1</string>
+    <string>1.0.2</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
+    <string>AppIcon.icns</string>
     <key>LSMinimumSystemVersion</key>
     <string>10.15</string>
     <key>NSHighResolutionCapable</key>
@@ -58,30 +55,35 @@ EOF
 # 2. Launcher script
 cat > "$APP_DIR/Contents/MacOS/$APP_NAME" << 'LAUNCHER'
 #!/bin/bash
-# ArXivDailyDigest - macOS App Launcher
+# AstroPaperDigest - macOS App Launcher
 # Double-click to run the full pipeline
 
 # Log file for debugging
-LOG_FILE="$HOME/Library/Logs/ArXivDailyDigest.log"
+LOG_FILE="$HOME/Library/Logs/AstroPaperDigest.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "=== $(date) ==="
 
 # macOS .app launches with minimal PATH - fix it
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$PATH"
 
+# Force native arm64 on Apple Silicon (avoid Rosetta x86_64 mismatch with arm64 packages)
+if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ] && [ "$(arch)" != "arm64" ]; then
+    exec arch -arm64 "$0" "$@"
+fi
+
 # Determine project directory
-# Script is at: PROJECT_DIR/ArXivDailyDigest.app/Contents/MacOS/ArXivDailyDigest
+# Script is at: ROOT/AstroPaperDigest.app/Contents/MacOS/AstroPaperDigest
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-PROJECT_DIR="$(cd "$APP_DIR/.." && pwd)"
+PROJECT_DIR="$(cd "$APP_DIR/../AstroPaperDigest" && pwd)"
 
 cd "$PROJECT_DIR"
 
 # Detect Python: prefer .venv, then venv, then system python3
-# On first run (or if venv is broken/moved), create .venv and install dependencies
-if ! "$PROJECT_DIR/.venv/bin/python3" -c "pass" 2>/dev/null; then
+# On first run (or if venv is broken/moved/wrong arch), create .venv and install dependencies
+if ! "$PROJECT_DIR/.venv/bin/python3" -c "import pydantic" 2>/dev/null; then
     rm -rf "$PROJECT_DIR/.venv"
-    osascript -e 'display notification "Setting up Python environment..." with title "ArXivDailyDigest"'
+    osascript -e 'display notification "Setting up Python environment..." with title "AstroPaperDigest"'
     python3 -m venv "$PROJECT_DIR/.venv"
     "$PROJECT_DIR/.venv/bin/pip" install --upgrade pip -q
     "$PROJECT_DIR/.venv/bin/pip" install -r "$PROJECT_DIR/requirements.txt" -q
@@ -95,35 +97,22 @@ else
     PYTHON_BIN="python3"
 fi
 
-# Load .env if it exists
-if [ -f "$PROJECT_DIR/.env" ]; then
-    while IFS='=' read -r key value; do
-        [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-        key="${key#"${key%%[![:space:]]*}"}"
-        key="${key%"${key##*[![:space:]]}"}"
-        value="${value#"${value%%[![:space:]]*}"}"
-        value="${value%"${value##*[![:space:]]}"}"
-        if [[ "$value" == \"*\" ]]; then
-            value="${value:1:${#value}-2}"
-        fi
-        export "$key=$value"
-    done < "$PROJECT_DIR/.env"
-fi
-
 # Check if server is already running on port 5123
 echo "Checking for existing server..."
-if "$PYTHON_BIN" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5123', timeout=2)" 2>/dev/null; then
-    echo "Server already running. Opening browser..."
+STATUS_RESPONSE=$(curl -fsS --connect-timeout 2 http://127.0.0.1:5123/status 2>/dev/null || true)
+if echo "$STATUS_RESPONSE" | grep -q '"app":"AstroPaperDigest"'; then
+    echo "AstroPaperDigest is already running. Opening browser..."
+    osascript -e 'display notification "AstroPaperDigest is already running." with title "AstroPaperDigest"' 2>/dev/null
     open "http://127.0.0.1:5123"
     exit 0
 fi
 
-# Port occupied by something else - kill it
+# Never kill an unrelated process that owns the configured port
 EXISTING_PID=$(lsof -ti :5123 2>/dev/null)
 if [ -n "$EXISTING_PID" ]; then
-    echo "Killing non-responsive process on port 5123 (PID: $EXISTING_PID)..."
-    kill -9 $EXISTING_PID 2>/dev/null
-    sleep 2
+    echo "ERROR: Port 5123 is used by another process (PID: $EXISTING_PID)."
+    osascript -e 'display alert "AstroPaperDigest could not start" message "Port 5123 is being used by another application."' 2>/dev/null
+    exit 1
 fi
 
 # Start Flask in background
@@ -162,13 +151,19 @@ LAUNCHER
 
 chmod +x "$APP_DIR/Contents/MacOS/$APP_NAME"
 
-# 3. App icon (convert .iconset to .icns using iconutil)
+# 3. App icon
+PREBUILT_ICNS="assets/AppIcon.icns"
 ICONSET_DIR="assets/icon.iconset"
 ICNS_FILE="$APP_DIR/Contents/Resources/AppIcon.icns"
 
-if [ -d "$ICONSET_DIR" ]; then
+if [ -f "$PREBUILT_ICNS" ]; then
+    echo "Installing prebuilt AppIcon.icns..."
+    cp "$PREBUILT_ICNS" "$ICNS_FILE"
+elif [ -d "$ICONSET_DIR" ]; then
     echo "Generating AppIcon.icns from iconset..."
-    iconutil -c icns "$ICONSET_DIR" -o "$ICNS_FILE"
+    if ! iconutil -c icns "$ICONSET_DIR" -o "$ICNS_FILE"; then
+        echo "WARNING: Icon conversion failed; app will use the default icon."
+    fi
 elif [ -f "assets/icon_1024.png" ]; then
     echo "Generating iconset from icon_1024.png..."
     TMPICON=$(mktemp -d)/icon.iconset
@@ -209,14 +204,6 @@ if ! .venv/bin/python3 -m pip install -r requirements.txt -q; then
 fi
 
 echo ""
-echo "Done! Created: $APP_DIR"
+echo "Done! Created: $APP_NAME.app"
 echo "Python venv ready at .venv/"
-echo "Double-click $APP_DIR to launch ArXivDailyDigest."
-
-# Optionally link to /Applications for Launchpad/Spotlight access
-LINK_PATH="/Applications/$APP_NAME.app"
-if [ -L "$LINK_PATH" ] || [ ! -e "$LINK_PATH" ]; then
-    ln -sf "$SCRIPT_DIR/$APP_DIR" "$LINK_PATH" 2>/dev/null && \
-        echo "Linked to $LINK_PATH" || \
-        echo "Tip: run 'sudo ln -sf \"$SCRIPT_DIR/$APP_DIR\" $LINK_PATH' for Launchpad access"
-fi
+echo "Double-click $APP_NAME.app to launch AstroPaperDigest."

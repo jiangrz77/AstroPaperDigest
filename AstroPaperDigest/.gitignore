@@ -1,0 +1,21 @@
+# Secrets - NEVER commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Generated outputs
+output/
+feedback.json
+preferences.json
+
+# Personal data (contains local paths)
+data/AllCollection.bib
+data/ArxivDailyCollection.bib

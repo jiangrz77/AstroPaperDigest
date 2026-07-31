@@ -1,5 +1,9 @@
 arxiv_categories:
+- astro-ph.CO
+- astro-ph.EP
 - astro-ph.GA
+- astro-ph.HE
+- astro-ph.IM
 - astro-ph.SR
 keywords:
 - first stars
@@ -74,4 +78,3 @@ email:
 filter:
   max_candidates_for_llm: 80
   score_threshold: 7
-  fetch_days: 3

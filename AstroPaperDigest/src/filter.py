@@ -1,7 +1,6 @@
 """Category + keyword filtering to reduce candidate pool before LLM ranking."""
 
 import re
-from collections import Counter
 
 
 def category_filter(papers: list[dict], categories: list[str]) -> list[dict]:
