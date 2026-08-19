@@ -13,10 +13,14 @@ from typing import Optional
 from urllib.request import Request, urlopen
 
 import arxiv
+import requests
+import urllib.request
 
 
 _MIN_REQUEST_INTERVAL = 3.1
 _PAGE_SIZE = 300
+# arXiv throttles large id_list requests; keep each API call small.
+_ID_LIST_BATCH_SIZE = 50
 _PROJECT_DIR = Path(__file__).resolve().parent.parent
 _RATE_LIMIT_FILE = _PROJECT_DIR / "output" / ".arxiv_api_rate_limit"
 _API_THREAD_LOCK = Lock()
@@ -57,13 +61,30 @@ def _api_request_session():
                 fcntl.flock(state.fileno(), fcntl.LOCK_UN)
 
 
-def _new_client() -> arxiv.Client:
-    """Create a single-connection client with compliant page pacing."""
-    return arxiv.Client(
+def _new_client(trust_env: bool = True) -> arxiv.Client:
+    """Create a single-connection client with compliant page pacing.
+
+    Args:
+        trust_env: honour the system HTTP(S)_PROXY environment. Pass False to
+            force a direct connection (fallback when the proxy is broken).
+    """
+    client = arxiv.Client(
         page_size=_PAGE_SIZE,
         delay_seconds=_MIN_REQUEST_INTERVAL,
         num_retries=0,
     )
+    client._session.trust_env = trust_env
+    # The arxiv library issues requests without a timeout; a stalled proxy or
+    # network can hang the pipeline for minutes. Enforce our own timeout so
+    # failures surface quickly instead of blocking forever.
+    original_get = client._session.get
+
+    def get_with_timeout(url, **kwargs):
+        kwargs.setdefault("timeout", 30)
+        return original_get(url, **kwargs)
+
+    client._session.get = get_with_timeout
+    return client
 
 
 def _recent_date_label(target_date: str) -> str:
@@ -79,19 +100,24 @@ def _parse_recent_listing_ids(
     target_date: str,
 ) -> Optional[list[str]]:
     """Extract one date's authoritative IDs from the astro-ph recent page."""
-    label = re.escape(_recent_date_label(target_date))
-    section_match = re.search(
-        rf"<h3>{label} \(showing \d+ of \d+ entries \)</h3>"
+    target = date_cls.fromisoformat(target_date)
+    # arXiv list pages write the day of month without zero padding
+    # (e.g. "Thu, 2 Jan 2025"); tolerate both padded and unpadded forms.
+    section_pattern = re.compile(
+        rf"<h3>{_WEEKDAYS[target.weekday()]}, (\d{{1,2}}) "
+        rf"{_MONTHS[target.month - 1]} {target.year} "
+        rf"\(showing \d+ of \d+ entries \)</h3>"
         rf"(.*?)(?=</dl>)",
-        content,
         re.DOTALL,
     )
-    if section_match is None:
-        return None
-    return re.findall(
-        r'href\s*=\s*["\']/abs/([0-9.]+)["\']',
-        section_match.group(1),
-    )
+    for section_match in section_pattern.finditer(content):
+        if int(section_match.group(1)) != target.day:
+            continue
+        return re.findall(
+            r'href\s*=\s*["\']/abs/([0-9.]+)["\']',
+            section_match.group(2),
+        )
+    return None
 
 
 def _fetch_recent_listing_ids(target_date: str) -> Optional[list[str]]:
@@ -101,9 +127,66 @@ def _fetch_recent_listing_ids(target_date: str) -> Optional[list[str]]:
         headers={"User-Agent": _ARXIV_USER_AGENT},
     )
     with _api_request_session():
-        with urlopen(request, timeout=30) as response:
-            content = response.read().decode("utf-8")
+        try:
+            with urlopen(request, timeout=30) as response:
+                content = response.read().decode("utf-8")
+        except Exception:
+            # The system proxy may be unreachable; retry with a direct
+            # connection before giving up on the official listing.
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=30) as response:
+                content = response.read().decode("utf-8")
     return _parse_recent_listing_ids(content, target_date)
+
+
+def _paper_from_result(
+    result,
+    categories: list[str],
+    include_cross: bool,
+    include_replacements: bool,
+    replacement_stream: bool = False,
+) -> Optional[dict]:
+    """Convert an arxiv.Result into a paper dict (or None if filtered out).
+
+    Returns a dict with "base_id" (version-stripped) and "paper" so callers can
+    deduplicate by the version-less identifier.
+    """
+    paper_id = result.entry_id.split("/")[-1]
+    base_id = re.sub(r"v\d+$", "", paper_id)
+    paper_categories = [str(category) for category in result.categories]
+    if not set(paper_categories).intersection(categories):
+        return None
+
+    if replacement_stream:
+        if result.updated == result.published:
+            return None
+        paper_type = "replacement"
+    elif result.updated != result.published:
+        # A newer version in the submitted stream is a replacement; honour the
+        # same preferences as the updated stream.
+        if not include_replacements:
+            return None
+        paper_type = "replacement"
+    else:
+        paper_type = _determine_paper_type(result, categories)
+        if paper_type == "cross" and not include_cross:
+            return None
+
+    return {
+        "base_id": base_id,
+        "paper": {
+            "id": paper_id,
+            "title": result.title.replace("\n", " ").strip(),
+            "authors": [a.name for a in result.authors],
+            "abstract": result.summary.replace("\n", " ").strip(),
+            "categories": paper_categories,
+            "published": result.published.isoformat(),
+            "updated": result.updated.isoformat(),
+            "pdf_url": result.pdf_url,
+            "primary_category": result.primary_category,
+            "paper_type": paper_type,
+        },
+    }
 
 
 def _fetch_listed_papers(
@@ -111,44 +194,57 @@ def _fetch_listed_papers(
     categories: list[str],
     include_cross: bool,
     include_replacements: bool,
+    trust_env: bool = True,
 ) -> list[dict]:
-    """Fetch metadata for the exact IDs published in an official listing."""
+    """Fetch metadata for the exact IDs published in an official listing.
+
+    The id_list is fetched in small batches: arXiv rate-limits large id_list
+    requests, and the shared 3.1s limiter applies between batches.
+    """
     if not ids:
         return []
 
-    client = _new_client()
-    search = arxiv.Search(id_list=ids, max_results=len(ids))
+    client = _new_client(trust_env=trust_env)
     papers_by_id = {}
-    with _api_request_session():
-        for result in client.results(search):
-            paper_id = result.entry_id.split("/")[-1]
-            base_id = re.sub(r"v\d+$", "", paper_id)
-            paper_categories = [str(category) for category in result.categories]
-            if not set(paper_categories).intersection(categories):
-                continue
 
-            paper_type = (
-                "replacement"
-                if result.updated != result.published
-                else _determine_paper_type(result, categories)
-            )
-            if paper_type == "cross" and not include_cross:
-                continue
-            if paper_type == "replacement" and not include_replacements:
-                continue
-
-            papers_by_id[base_id] = {
-                "id": paper_id,
-                "title": result.title.replace("\n", " ").strip(),
-                "authors": [author.name for author in result.authors],
-                "abstract": result.summary.replace("\n", " ").strip(),
-                "categories": paper_categories,
-                "published": result.published.isoformat(),
-                "updated": result.updated.isoformat(),
-                "pdf_url": result.pdf_url,
-                "primary_category": result.primary_category,
-                "paper_type": paper_type,
-            }
+    for start in range(0, len(ids), _ID_LIST_BATCH_SIZE):
+        batch = ids[start:start + _ID_LIST_BATCH_SIZE]
+        search = arxiv.Search(id_list=batch, max_results=len(batch))
+        for attempt in range(2):
+            try:
+                with _api_request_session():
+                    for result in client.results(search):
+                        item = _paper_from_result(
+                            result,
+                            categories,
+                            include_cross,
+                            include_replacements,
+                        )
+                        if item is None:
+                            continue
+                        if item["base_id"] not in papers_by_id:
+                            papers_by_id[item["base_id"]] = item["paper"]
+                break
+            except requests.exceptions.ProxyError:
+                if trust_env and attempt == 0:
+                    # The system proxy is unreachable; retry directly.
+                    print("  Proxy connection failed; retrying without the system proxy...")
+                    client = _new_client(trust_env=False)
+                    continue
+                raise
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt == 0:
+                    print(f"  arXiv API connection error; retrying once ({e})...")
+                    time.sleep(5)
+                    continue
+                raise
+            except arxiv.HTTPError as e:
+                if e.status == 429 and attempt == 0:
+                    # A single polite retry after a backoff; never hammer.
+                    print("  arXiv API rate limited; waiting 30s before one retry...")
+                    time.sleep(30)
+                    continue
+                raise
 
     return [
         papers_by_id[paper_id]
@@ -182,23 +278,46 @@ def fetch_papers(
         published, pdf_url, entry, paper_type
     """
     if target_date:
-        listed_ids = _fetch_recent_listing_ids(target_date)
+        # The recent page is labelled with the announcement date in US Eastern
+        # time, which is one day earlier than the user's BJT digest date
+        # (announcements appear at 20:00 ET = 08:00 BJT the next day).
+        et_target_date = (
+            date_cls.fromisoformat(target_date) - timedelta(days=1)
+        ).isoformat()
+        try:
+            listed_ids = _fetch_recent_listing_ids(et_target_date)
+        except Exception as e:
+            # The official listing is an optimisation; a network failure here
+            # must not kill the run - fall back to the API query path.
+            print(f"  Recent listing unavailable ({e}); using API query fallback.")
+            listed_ids = None
         if listed_ids is not None:
             print(
                 f"  Official astro-ph listing: {len(listed_ids)} entries "
-                f"for {_recent_date_label(target_date)}"
+                f"for {_recent_date_label(et_target_date)}"
             )
-            return _fetch_listed_papers(
-                listed_ids,
-                categories,
-                include_cross,
-                include_replacements,
-            )
+            try:
+                return _fetch_listed_papers(
+                    listed_ids,
+                    categories,
+                    include_cross,
+                    include_replacements,
+                )
+            except requests.exceptions.ProxyError:
+                print("  Proxy connection failed; retrying without the system proxy...")
+                return _fetch_listed_papers(
+                    listed_ids,
+                    categories,
+                    include_cross,
+                    include_replacements,
+                    trust_env=False,
+                )
 
     # Build query: (cat:astro-ph.GA OR cat:astro-ph.SR OR ...)
     cat_query = " OR ".join(f"cat:{c}" for c in categories)
 
     client = _new_client()
+    proxy_retried = False
     effective_max = min(max_results, 300) if target_date else max_results
 
     submitted_search = arxiv.Search(
@@ -259,7 +378,8 @@ def fetch_papers(
         cutoff_start = None
         cutoff_end = datetime.now(timezone.utc) - timedelta(days=days)
 
-    for attempt in range(max_retries):
+    attempt = 0
+    while attempt < max_retries:
         papers_by_id = {}
         try:
             if attempt > 0:
@@ -282,37 +402,28 @@ def fetch_papers(
                         elif result_date < cutoff_end:
                             break
 
-                        paper_id = result.entry_id.split("/")[-1]
-                        base_id = re.sub(r"v\d+$", "", paper_id)
-                        if base_id in papers_by_id:
+                        item = _paper_from_result(
+                            result,
+                            categories,
+                            include_cross,
+                            include_replacements,
+                            replacement_stream=replacement_stream,
+                        )
+                        if item is None:
                             continue
-
-                        if replacement_stream:
-                            if result.updated == result.published:
-                                continue
-                            paper_type = "replacement"
-                        else:
-                            paper_type = _determine_paper_type(
-                                result,
-                                categories,
-                            )
-
-                        if paper_type == "cross" and not include_cross:
+                        if item["base_id"] in papers_by_id:
                             continue
-
-                        papers_by_id[base_id] = {
-                            "id": paper_id,
-                            "title": result.title.replace("\n", " ").strip(),
-                            "authors": [a.name for a in result.authors],
-                            "abstract": result.summary.replace("\n", " ").strip(),
-                            "categories": [c for c in result.categories],
-                            "published": result.published.isoformat(),
-                            "updated": result.updated.isoformat(),
-                            "pdf_url": result.pdf_url,
-                            "primary_category": result.primary_category,
-                            "paper_type": paper_type,
-                        }
+                        papers_by_id[item["base_id"]] = item["paper"]
             break  # Success
+        except requests.exceptions.ProxyError:
+            if not proxy_retried:
+                # The system proxy is unreachable; retry immediately with a
+                # direct connection, without consuming the retry budget.
+                proxy_retried = True
+                print("  Proxy connection failed; retrying without the system proxy...")
+                client = _new_client(trust_env=False)
+                continue
+            raise
         except arxiv.HTTPError as e:
             if e.status == 429:
                 print("  arXiv API returned HTTP 429.")
@@ -326,6 +437,7 @@ def fetch_papers(
             print(f"  Error fetching papers: {e}")
             if attempt == max_retries - 1:
                 raise
+        attempt += 1
 
     return list(papers_by_id.values())
 

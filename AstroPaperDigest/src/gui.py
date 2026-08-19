@@ -8,6 +8,7 @@ pipeline runs in background -> page auto-updates when done.
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -314,18 +315,40 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
         
         return_code, stdout = _stream_pipeline(cmd)
         if return_code == 0:
-            digest_path = get_latest_digest_path()
-            if digest_path:
-                _current_digest = parse_digest(digest_path)
+            # Locate the digest actually written by this run. Prefer the file
+            # for the requested date, then the latest file, then the path the
+            # CLI printed (covers custom digest_dir settings).
+            digest_path = ""
+            if target_date:
+                digest_path = get_digest_path_for_date(target_date)
+            if not digest_path:
+                digest_path = get_latest_digest_path()
+            if not digest_path:
+                match = re.search(r"Digest:\s*(\S+)", stdout)
+                if match:
+                    digest_path = match.group(1).strip()
+            try:
+                if digest_path and os.path.exists(digest_path):
+                    _current_digest = parse_digest(digest_path)
+            except Exception:
+                _current_digest = None
             _pipeline_status = "done"
             # Set contextual message based on result
-            if "No papers found" in stdout or "No new papers since last digest" in stdout:
+            if (
+                "No papers found" in stdout
+                or "No new papers since last digest" in stdout
+                or "No papers matched the filter criteria" in stdout
+            ):
                 if _current_digest and _current_digest["total_papers"] == 0:
                     status = _current_digest.get("status", "no_papers")
                     if status == "no_papers":
                         _pipeline_message = "No available papers (arxiv has not been updated yet)."
-                    else:
+                    elif status == "no_new_papers":
                         _pipeline_message = "No new papers since last digest."
+                    elif status == "no_matches":
+                        _pipeline_message = "No papers matched your research keywords."
+                    else:
+                        _pipeline_message = "No new papers found."
                 else:
                     _pipeline_message = "No new papers found."
             else:
@@ -342,7 +365,16 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
                     "Repeatedly clicking Re-run will extend the problem."
                 )
             else:
-                _pipeline_message = (stdout or "Unknown error")[-800:]
+                if "ERROR:" in stdout:
+                    # The CLI prints clean single-line errors; prefer those
+                    # over a raw traceback in the browser status page.
+                    error_lines = [
+                        line for line in stdout.splitlines()
+                        if line.startswith("ERROR:")
+                    ]
+                    _pipeline_message = "\n".join(error_lines) or (stdout or "Unknown error")[-800:]
+                else:
+                    _pipeline_message = (stdout or "Unknown error")[-800:]
     except subprocess.TimeoutExpired:
         _pipeline_status = "error"
         _pipeline_message = "Pipeline timed out (>15 minutes)."
@@ -430,7 +462,7 @@ textarea{height:80px;resize:vertical}
     <input type="text" id="model" name="model" value="{{ cur_model or 'deepseek-chat' }}">
     <div id="baseurl-group" style="display:none">
       <label for="base_url">Base URL</label>
-      <input type="text" id="base_url" name="base_url" placeholder="https://api.example.com/v1">
+      <input type="text" id="base_url" name="base_url" placeholder="https://api.example.com/v1" value="{{ cur_base_url or '' }}">
     </div>
   </div>
 
@@ -473,8 +505,8 @@ textarea{height:80px;resize:vertical}
     <input type="text" id="smtp_server" name="smtp_server" placeholder="smtp.gmail.com" value="{{ cur_smtp_server or '' }}">
     <label for="smtp_protocol">Protocol</label>
     <select id="smtp_protocol" name="smtp_protocol" onchange="updatePort()">
-      <option value="starttls">STARTTLS (port 587)</option>
-      <option value="ssl">SSL (port 465)</option>
+      <option value="starttls" {% if not cur_use_ssl %}selected{% endif %}>STARTTLS (port 587)</option>
+      <option value="ssl" {% if cur_use_ssl %}selected{% endif %}>SSL (port 465)</option>
     </select>
     <label for="smtp_port">Port (optional, auto-filled)</label>
     <input type="text" id="smtp_port" name="smtp_port" placeholder="587" value="{{ cur_smtp_port or '587' }}">
@@ -573,15 +605,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 <script>
 function navigateToDate(dateStr) {
+  if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return;
   fetch('/preferences', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({last_viewed_date: dateStr})});
   window.location.href = '/digest/' + dateStr;
 }
 function shiftDate(delta) {
   const picker = document.getElementById('date-picker');
   const today = '{{ today_str }}';
+  if (!picker.value || !/^\d{4}-\d{2}-\d{2}$/.test(picker.value)) picker.value = today;
   if (delta > 0 && picker.value >= today) return;
   const parts = picker.value.split('-');
   const d = new Date(parseInt(parts[0]), parseInt(parts[1])-1, parseInt(parts[2]));
+  if (isNaN(d.getTime())) { picker.value = today; return; }
   d.setDate(d.getDate() + delta);
   const y = d.getFullYear();
   const m = String(d.getMonth()+1).padStart(2,'0');
@@ -619,7 +654,7 @@ function poll() {
   fetch('/status').then(r=>r.json()).then(d=>{
     document.getElementById('msg').textContent = d.message;
     if(d.status === 'done') {
-      window.location.href = '/digest/{{ display_date }}';
+      window.location.href = '/digest';
     } else if(d.status === 'error') {
       document.getElementById('spinner').style.display = 'none';
       document.getElementById('error').style.display = 'block';
@@ -767,7 +802,7 @@ function rerunWithPrefs() {
   const includeCross = document.getElementById('chk-cross').checked;
   const includeRepl = document.getElementById('chk-repl').checked;
   const picker = document.getElementById('date-picker');
-  const targetDate = picker ? picker.value : '';
+  const targetDate = (picker && /^\d{4}-\d{2}-\d{2}$/.test(picker.value)) ? picker.value : '';
   // Save preferences
   fetch('/preferences', {
     method: 'POST',
@@ -780,6 +815,7 @@ function rerunWithPrefs() {
 }
 
 function navigateToDate(dateStr) {
+  if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return;
   // Save last viewed date
   fetch('/preferences', {
     method: 'POST',
@@ -791,9 +827,11 @@ function navigateToDate(dateStr) {
 function shiftDate(delta) {
   const picker = document.getElementById('date-picker');
   const today = '{{ today_str }}';
+  if (!picker.value || !/^\d{4}-\d{2}-\d{2}$/.test(picker.value)) picker.value = today;
   if (delta > 0 && picker.value >= today) return;
   const parts = picker.value.split('-');
   const d = new Date(parseInt(parts[0]), parseInt(parts[1])-1, parseInt(parts[2]));
+  if (isNaN(d.getTime())) { picker.value = today; return; }
   d.setDate(d.getDate() + delta);
   const y = d.getFullYear();
   const m = String(d.getMonth()+1).padStart(2,'0');
@@ -955,15 +993,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 <script>
 function navigateToDate(dateStr) {
+  if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return;
   fetch('/preferences', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({last_viewed_date: dateStr})});
   window.location.href = '/digest/' + dateStr;
 }
 function shiftDate(delta) {
   const picker = document.getElementById('date-picker');
   const today = '{{ today_str }}';
+  if (!picker.value || !/^\d{4}-\d{2}-\d{2}$/.test(picker.value)) picker.value = today;
   if (delta > 0 && picker.value >= today) return;
   const parts = picker.value.split('-');
   const d = new Date(parseInt(parts[0]), parseInt(parts[1])-1, parseInt(parts[2]));
+  if (isNaN(d.getTime())) { picker.value = today; return; }
   d.setDate(d.getDate() + delta);
   const y = d.getFullYear();
   const m = String(d.getMonth()+1).padStart(2,'0');
@@ -1012,7 +1053,10 @@ _ARXIV_HOLIDAYS_2026 = {
 
 def _is_arxiv_update_day(date_str: str) -> bool:
     """Check if date is a valid arxiv update day (weekday + not holiday)."""
-    d = date.fromisoformat(date_str)
+    try:
+        d = date.fromisoformat(date_str)
+    except (TypeError, ValueError):
+        return False
     if d.weekday() >= 5:  # Sat/Sun
         return False
     if date_str in _ARXIV_HOLIDAYS_2026:
@@ -1023,9 +1067,13 @@ def _is_arxiv_update_day(date_str: str) -> bool:
 def _render_digest(digest=None):
     """Render digest template with computed variables."""
     d = digest or _current_digest
+    today_str = date.today().isoformat()
+    # Old digest files may not carry a parseable date; fall back to today so
+    # date navigation and the update-day check never see an empty value.
+    if not d.get("date"):
+        d["date"] = today_str
     # Handle empty digests (0 papers)
     if d["total_papers"] == 0:
-        today_str = date.today().isoformat()
         status = d.get("status", "no_papers")
         is_today = (d.get("date", "") == today_str)
         if is_today and status == "no_papers":
@@ -1038,16 +1086,14 @@ def _render_digest(digest=None):
         return render_template_string(
             NO_DIGEST_TEMPLATE,
             selected_date=d.get("date", today_str),
-            is_today=is_today,
+            today_str=today_str,
             available_dates=available,
             custom_message=msg,
             is_update_day=_is_arxiv_update_day(d.get("date", today_str))
         )
-    displayed = sum(len(t["papers"]) for t in d["tiers"])
-    not_displayed = d["total_papers"] - displayed
     prefs = load_preferences()
     today_str = date.today().isoformat()
-    return render_template_string(DIGEST_TEMPLATE, digest=d, not_displayed=not_displayed, prefs=prefs, today_str=today_str)
+    return render_template_string(DIGEST_TEMPLATE, digest=d, prefs=prefs, today_str=today_str)
 
 
 @app.route("/setup", methods=["GET"])
@@ -1119,6 +1165,11 @@ def setup_submit():
     else:
         api_key_env = "CUSTOM_API_KEY"
 
+    if provider == "custom" and not base_url:
+        abort(400, "Base URL is required for a custom provider.")
+    if not model:
+        abort(400, "Model name is required.")
+
     try:
         smtp_port = int(smtp_port_value) if smtp_port_value else (
             465 if smtp_protocol == "ssl" else 587
@@ -1184,6 +1235,10 @@ def setup_submit():
         config["email"]["use_ssl"] = (smtp_protocol == "ssl")
         config["email"]["smtp_port"] = smtp_port
         config["email"]["password_env"] = "EMAIL_APP_PASSWORD"
+    else:
+        # Leaving the email section empty should disable notifications,
+        # not keep stale default credentials active.
+        config["email"]["enabled"] = False
 
     # Write updated config
     with open(config_path, "w", encoding="utf-8") as f:
@@ -1225,7 +1280,7 @@ def index():
     return render_template_string(
         NO_DIGEST_TEMPLATE,
         selected_date=today_str,
-        is_today=True,
+        today_str=today_str,
         available_dates=available,
         is_update_day=_is_arxiv_update_day(today_str)
     )
@@ -1233,10 +1288,10 @@ def index():
 
 @app.route("/digest")
 def digest_page():
-    """Show the latest digest (redirect to status if not ready)."""
+    """Show the latest digest (fall back to the landing page if not ready)."""
     if _current_digest:
         return _render_digest()
-    return render_template_string(STATUS_PAGE, display_date=date.today().isoformat(), today_str=date.today().isoformat())
+    return redirect("/")
 
 
 @app.route("/digest/<date_str>")
@@ -1259,7 +1314,6 @@ def digest_by_date(date_str):
         return render_template_string(
             NO_DIGEST_TEMPLATE,
             selected_date=date_str,
-            is_today=False,
             available_dates=available,
             today_str=today_str,
             is_update_day=_is_arxiv_update_day(date_str)
@@ -1275,7 +1329,6 @@ def digest_by_date(date_str):
     return render_template_string(
         NO_DIGEST_TEMPLATE,
         selected_date=date_str,
-        is_today=(date_str == today_str),
         available_dates=available,
         today_str=today_str,
         is_update_day=_is_arxiv_update_day(date_str)
@@ -1361,7 +1414,7 @@ def post_feedback():
             "title": data.get("title", ""),
             "action": action,
             "original_score": data.get("original_score", 0),
-            "date": _current_digest.get("date", date.today().isoformat()) if _current_digest else date.today().isoformat(),
+            "date": (_current_digest.get("date") or date.today().isoformat()) if _current_digest else date.today().isoformat(),
         })
 
     save_feedback(feedback)

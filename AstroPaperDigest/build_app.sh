@@ -58,18 +58,19 @@ cat > "$APP_DIR/Contents/MacOS/$APP_NAME" << 'LAUNCHER'
 # AstroPaperDigest - macOS App Launcher
 # Double-click to run the full pipeline
 
+# macOS .app launches with minimal PATH - fix it
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$PATH"
+
+# Force native arm64 on Apple Silicon (avoid Rosetta x86_64 mismatch with arm64 packages).
+# Do this BEFORE opening the log so the re-executed script does not tee twice.
+if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ] && [ "$(arch)" != "arm64" ]; then
+    exec arch -arm64 "$0" "$@"
+fi
+
 # Log file for debugging
 LOG_FILE="$HOME/Library/Logs/AstroPaperDigest.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "=== $(date) ==="
-
-# macOS .app launches with minimal PATH - fix it
-export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$PATH"
-
-# Force native arm64 on Apple Silicon (avoid Rosetta x86_64 mismatch with arm64 packages)
-if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ] && [ "$(arch)" != "arm64" ]; then
-    exec arch -arm64 "$0" "$@"
-fi
 
 # Determine project directory
 # Script is at: ROOT/AstroPaperDigest.app/Contents/MacOS/AstroPaperDigest
@@ -99,7 +100,7 @@ fi
 
 # Check if server is already running on port 5123
 echo "Checking for existing server..."
-STATUS_RESPONSE=$(curl -fsS --connect-timeout 2 http://127.0.0.1:5123/status 2>/dev/null || true)
+STATUS_RESPONSE=$(curl -fsSL --connect-timeout 2 http://127.0.0.1:5123/status 2>/dev/null || true)
 if echo "$STATUS_RESPONSE" | grep -q '"app":"AstroPaperDigest"'; then
     echo "AstroPaperDigest is already running. Opening browser..."
     osascript -e 'display notification "AstroPaperDigest is already running." with title "AstroPaperDigest"' 2>/dev/null
@@ -110,6 +111,13 @@ fi
 # Never kill an unrelated process that owns the configured port
 EXISTING_PID=$(lsof -ti :5123 2>/dev/null)
 if [ -n "$EXISTING_PID" ]; then
+    # A server still on the first-run setup page answers /status with a
+    # redirect, so recognise it as our own instance instead of a port conflict.
+    if ps -p "$EXISTING_PID" -o command= 2>/dev/null | grep -q "src/gui.py"; then
+        echo "AstroPaperDigest is already running (setup pending). Opening browser..."
+        open "http://127.0.0.1:5123"
+        exit 0
+    fi
     echo "ERROR: Port 5123 is used by another process (PID: $EXISTING_PID)."
     osascript -e 'display alert "AstroPaperDigest could not start" message "Port 5123 is being used by another application."' 2>/dev/null
     exit 1
@@ -118,6 +126,10 @@ fi
 # Start Flask in background
 "$PYTHON_BIN" "$PROJECT_DIR/src/gui.py" --no-browser &
 FLASK_PID=$!
+
+# If this launcher exits or is killed (e.g. the app is quit), take Flask down
+# with it so the port is never left orphaned.
+trap 'kill "$FLASK_PID" 2>/dev/null' EXIT
 
 echo "Flask starting (PID: $FLASK_PID)..."
 

@@ -7,6 +7,7 @@ and outputs BibTeX + Markdown digest.
 
 import argparse
 import os
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -133,7 +134,7 @@ def main():
     print(f"  Digest date: {arxiv_date}")
 
     # Step 2: Fetch papers
-    print(f"\n[2/5] Fetching papers...")
+    print("\n[2/5] Fetching papers...")
     categories = config.get("arxiv_categories", [
         "astro-ph.CO",
         "astro-ph.EP",
@@ -144,12 +145,17 @@ def main():
     ])
     include_cross = not args.no_cross
     include_replacements = not args.no_replacements
-    papers = fetch_papers(
-        categories,
-        target_date=arxiv_date,
-        include_cross=include_cross,
-        include_replacements=include_replacements,
-    )
+    try:
+        papers = fetch_papers(
+            categories,
+            target_date=arxiv_date,
+            include_cross=include_cross,
+            include_replacements=include_replacements,
+        )
+    except Exception as e:
+        print(f"ERROR: Failed to fetch papers from arXiv: {e}")
+        print("Check your network/proxy settings and try again.")
+        sys.exit(2)
     print(f"  Fetched {len(papers)} papers")
     
     # Count paper types
@@ -165,10 +171,12 @@ def main():
         _write_empty_digest(digest_dir, "no_papers", arxiv_date)
         return
     
-    # Check for duplicates against latest digest (skip when target-date is specified)
+    # Check for duplicates against latest digest (skip when target-date is
+    # specified, or when the latest digest is for the same date we are
+    # regenerating - otherwise re-running today would wipe the existing digest).
     if not args.target_date:
         latest = get_latest_digest_path()
-        if latest:
+        if latest and os.path.basename(latest) != f"digest_{arxiv_date}.md":
             prev = parse_digest(latest)
             prev_ids = set()
             for tier in prev["tiers"]:
@@ -189,7 +197,9 @@ def main():
     candidates = filter_papers(papers, categories, keywords, max_candidates)
     
     if not candidates:
-        print("  No papers matched the filter criteria. Exiting.")
+        print("  No papers matched the filter criteria. Writing empty digest.")
+        digest_dir = output_cfg.get("digest_dir", "./output/digests")
+        _write_empty_digest(digest_dir, "no_matches", arxiv_date)
         return
     
     # Step 4: Rank papers with LLM
@@ -206,7 +216,9 @@ def main():
         ranked = rank_papers(candidates, profile, llm_config)
     
     if not ranked:
-        print("  Warning: No papers were successfully scored. Exiting.")
+        print("  Warning: No papers were successfully scored. Writing empty digest.")
+        digest_dir = output_cfg.get("digest_dir", "./output/digests")
+        _write_empty_digest(digest_dir, "no_scores", arxiv_date)
         return
     
     print(f"  Top scored paper: {ranked[0]['title'][:80]}... (score: {ranked[0]['score']})")

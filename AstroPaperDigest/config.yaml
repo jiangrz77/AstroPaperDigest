@@ -59,7 +59,7 @@ keywords:
 - neutron star
 - gravitational wave
 - machine learning
-bib_file: data/references.bib
+bib_file: data/references-example.bib
 llm:
   base_url: https://api.deepseek.com
   api_key_env: DEEPSEEK_API_KEY

@@ -21,7 +21,7 @@ def extract_categories(entries: list[dict]) -> Counter:
         if pc:
             cats[pc] += 1
         # Also parse the keywords field for category info
-        kw = e.get("keywords", "")
+        kw = e.get("keywords") or ""
         for part in kw.split(","):
             part = part.strip()
             if "Astrophysics -" in part:
@@ -33,7 +33,7 @@ def extract_keywords(entries: list[dict]) -> Counter:
     """Extract and count keywords from all entries."""
     kws = Counter()
     for e in entries:
-        kw = e.get("keywords", "")
+        kw = e.get("keywords") or ""
         for part in kw.split(","):
             part = part.strip()
             # Skip arxiv category labels
@@ -54,7 +54,7 @@ def extract_recent_titles(entries: list[dict], year_threshold: int = 2025) -> li
         except ValueError:
             year = 0
         if year >= year_threshold:
-            title = e.get("title", "").replace("{", "").replace("}", "").replace("\n", " ")
+            title = (e.get("title") or "").replace("{", "").replace("}", "").replace("\n", " ")
             recent.append(title)
     return recent
 
