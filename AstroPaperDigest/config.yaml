@@ -69,7 +69,7 @@ output:
   digest_dir: ./output/digests
 email:
   enabled: true
-  smtp_server: cstnet.mail.cn
+  smtp_server: mail.cstnet.cn
   smtp_port: 587
   use_ssl: false
   sender: rzjiang@pmo.ac.cn
