@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 import webbrowser
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread, Timer
@@ -334,7 +334,13 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
                 _current_digest = None
             _pipeline_status = "done"
             # Set contextual message based on result
-            if (
+            if "NOT_YET_AVAILABLE" in stdout:
+                _pipeline_message = "今日批次尚未公布（预计约 10:00 后可见），未生成 digest。"
+            elif "NO_ANNOUNCEMENT" in stdout:
+                _pipeline_message = "arXiv 当日无公布批次（周末/节假日顺延），已生成空 digest。"
+            elif "DEFERRED_OR_LAGGING" in stdout:
+                _pipeline_message = "该日批次疑似被顺延（节假日）或页面滞后，已生成空 digest。"
+            elif (
                 "No papers found" in stdout
                 or "No new papers since last digest" in stdout
                 or "No papers matched the filter criteria" in stdout
@@ -1051,6 +1057,19 @@ _ARXIV_HOLIDAYS_2026 = {
     "2026-09-07", "2026-11-26", "2026-12-25", "2026-12-29", "2026-12-31",
 }
 
+def _digest_today_str() -> str:
+    """Today's date in the configured digest timezone (config.yaml)."""
+    try:
+        import yaml
+        from zoneinfo import ZoneInfo
+        with open(os.path.join(_PROJECT_DIR, "config.yaml"), "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        tz_name = (cfg.get("timezone") or {}).get("digest", "Asia/Shanghai")
+        return datetime.now(ZoneInfo(tz_name)).date().isoformat()
+    except Exception:
+        return date.today().isoformat()
+
+
 def _is_arxiv_update_day(date_str: str) -> bool:
     """Check if date is a valid arxiv update day (weekday + not holiday)."""
     try:
@@ -1067,7 +1086,7 @@ def _is_arxiv_update_day(date_str: str) -> bool:
 def _render_digest(digest=None):
     """Render digest template with computed variables."""
     d = digest or _current_digest
-    today_str = date.today().isoformat()
+    today_str = _digest_today_str()
     # Old digest files may not carry a parseable date; fall back to today so
     # date navigation and the update-day check never see an empty value.
     if not d.get("date"):
@@ -1076,7 +1095,11 @@ def _render_digest(digest=None):
     if d["total_papers"] == 0:
         status = d.get("status", "no_papers")
         is_today = (d.get("date", "") == today_str)
-        if is_today and status == "no_papers":
+        if status == "no_announcement":
+            msg = "arXiv 当日无公布批次（周末不公布 / 节假日顺延）"
+        elif status == "deferred_or_lagging":
+            msg = "该日批次疑似顺延（节假日）或页面滞后，暂无内容"
+        elif is_today and status == "no_papers":
             msg = "No available papers (today's arxiv has not been updated yet)"
         elif is_today and status == "no_new_papers":
             msg = "No new papers since last digest"
@@ -1092,7 +1115,7 @@ def _render_digest(digest=None):
             is_update_day=_is_arxiv_update_day(d.get("date", today_str))
         )
     prefs = load_preferences()
-    today_str = date.today().isoformat()
+    today_str = _digest_today_str()
     return render_template_string(DIGEST_TEMPLATE, digest=d, prefs=prefs, today_str=today_str)
 
 
@@ -1255,8 +1278,8 @@ def index():
     """Landing page: show last viewed or latest digest."""
     if _pipeline_status == "running":
         prefs = load_preferences()
-        display_date = prefs.get("last_viewed_date") or date.today().isoformat()
-        return render_template_string(STATUS_PAGE, display_date=display_date, today_str=date.today().isoformat())
+        display_date = prefs.get("last_viewed_date") or _digest_today_str()
+        return render_template_string(STATUS_PAGE, display_date=display_date, today_str=_digest_today_str())
     # Try last viewed date first
     prefs = load_preferences()
     last_date = prefs.get("last_viewed_date", "")
@@ -1276,7 +1299,7 @@ def index():
             digest = parse_digest(digest_path)
             return _render_digest(digest)
     # Nothing available
-    today_str = date.today().isoformat()
+    today_str = _digest_today_str()
     return render_template_string(
         NO_DIGEST_TEMPLATE,
         selected_date=today_str,
@@ -1307,7 +1330,7 @@ def digest_by_date(date_str):
         digest = parse_digest(digest_path)
         return _render_digest(digest)
     # No digest for this date
-    today_str = date.today().isoformat()
+    today_str = _digest_today_str()
     available = get_available_dates()
     # Future dates: show no-update page, do NOT auto-run
     if date_str > today_str:
@@ -1360,7 +1383,7 @@ def run():
         include_replacements=prefs.get("include_replacements", True),
         target_date=target_date,
     )
-    return render_template_string(STATUS_PAGE, display_date=target_date or date.today().isoformat(), today_str=date.today().isoformat())
+    return render_template_string(STATUS_PAGE, display_date=target_date or _digest_today_str(), today_str=_digest_today_str())
 
 
 @app.route("/preferences", methods=["GET"])
@@ -1414,7 +1437,7 @@ def post_feedback():
             "title": data.get("title", ""),
             "action": action,
             "original_score": data.get("original_score", 0),
-            "date": (_current_digest.get("date") or date.today().isoformat()) if _current_digest else date.today().isoformat(),
+            "date": (_current_digest.get("date") or _digest_today_str()) if _current_digest else _digest_today_str(),
         })
 
     save_feedback(feedback)
@@ -1450,7 +1473,7 @@ def main():
         _current_digest = parse_digest(digest_path)
 
     # Only auto-run pipeline if today's digest doesn't exist
-    today_str = date.today().isoformat()
+    today_str = _digest_today_str()
     today_digest = os.path.join(str(_PROJECT_DIR), "output", "digests", f"digest_{today_str}.md")
     has_today = os.path.exists(today_digest)
 

@@ -1,4 +1,34 @@
-"""Fetch recent papers from the arXiv API."""
+"""Fetch recent papers from the arXiv API.
+
+Date semantics
+--------------
+A "digest date" (the YYYY-MM-DD used in digest_*.md filenames) is the date in
+the digest timezone (config ``timezone.digest``, default Asia/Shanghai) on
+which a batch of announcements becomes visible: arXiv announces at 20:00 US
+Eastern time, which is 08:00 the next calendar day in Asia/Shanghai, so the
+digest date equals the announcement date + 1 day in both calendars.
+
+Announcement schedule (current, in effect since ~Oct 2021)
+----------------------------------------------------------
+arXiv announces new submissions (plus replacements, cross-listings and
+withdrawal notices) at 20:00 ET on Sunday..Thursday; there are no
+announcements on Friday or Saturday.  Submission windows (14:00 ET cutoff),
+per https://info.arxiv.org/help/availability.html:
+
+    Mon 14:00 - Tue 14:00  -> announced Tue 20:00 ET (visible Wed 08:00 CST)
+    Tue 14:00 - Wed 14:00  -> announced Wed 20:00 ET
+    Wed 14:00 - Thu 14:00  -> announced Thu 20:00 ET
+    Thu 14:00 - Fri 14:00  -> announced Sun 20:00 ET
+    Fri 14:00 - Mon 14:00  -> announced Mon 20:00 ET
+
+The official per-category listing (https://arxiv.org/list/astro-ph/recent)
+labels each batch with the date its mailing completes, which equals the
+digest (visible) date.  It is the authoritative source for "which papers
+belong to which day": fetching the section labelled with the digest date
+directly needs no timezone arithmetic, and it automatically reflects holiday
+deferrals.  The API query path is only a fallback (listing unreachable, or a
+digest date older than the five sections the recent page keeps).
+"""
 
 import fcntl
 import os
@@ -6,7 +36,7 @@ import re
 import time
 from contextlib import contextmanager
 from datetime import date as date_cls
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as time_cls, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Optional
@@ -31,6 +61,11 @@ _MONTHS = (
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 )
+_DIGEST_TZ_DEFAULT = "Asia/Shanghai"
+_ANNOUNCEMENT_TZ = "America/New_York"
+_AVAILABLE_AFTER_DEFAULT = time_cls(10, 0)
+# Digest dates (BJT) that map to a non-announcement ET day: BJT Sat/Sun.
+_NO_ANNOUNCEMENT_WEEKDAYS = (5, 6)  # ET Fri/Sat
 
 
 @contextmanager
@@ -95,33 +130,97 @@ def _recent_date_label(target_date: str) -> str:
     )
 
 
-def _parse_recent_listing_ids(
-    content: str,
-    target_date: str,
-) -> Optional[list[str]]:
-    """Extract one date's authoritative IDs from the astro-ph recent page."""
-    target = date_cls.fromisoformat(target_date)
-    # arXiv list pages write the day of month without zero padding
-    # (e.g. "Thu, 2 Jan 2025"); tolerate both padded and unpadded forms.
+def _announcement_window_et(
+    et_announce: date_cls,
+) -> Optional[tuple[date_cls, date_cls]]:
+    """Return the [start, end) submission-window dates (ET, 14:00 cutoffs) for
+    the announcement on ``et_announce`` (an ET date), or None when arXiv makes
+    no announcement that day (Friday/Saturday).
+
+    Mirrors the current official schedule:
+        Sun: [Thu 14:00, Fri 14:00)
+        Mon: [Fri 14:00, Mon 14:00)
+        Tue-Thu: [previous day 14:00, same day 14:00)
+    """
+    wd = et_announce.weekday()  # 0=Mon .. 6=Sun
+    if wd == 6:  # Sunday announcement: Thursday-Friday window
+        return (
+            et_announce - timedelta(days=3),
+            et_announce - timedelta(days=2),
+        )
+    if wd == 0:  # Monday announcement: Friday-Monday window
+        return (
+            et_announce - timedelta(days=3),
+            et_announce,
+        )
+    if wd in (1, 2, 3):  # Tue, Wed, Thu: previous day to same day
+        return (
+            et_announce - timedelta(days=1),
+            et_announce,
+        )
+    return None  # Friday/Saturday: no announcement
+
+
+def _window_to_utc(
+    window_dates: tuple[date_cls, date_cls],
+) -> tuple[datetime, datetime]:
+    """Convert a (start, end) ET-date window into UTC cutoffs at 14:00 ET."""
+    try:
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo(_ANNOUNCEMENT_TZ)
+    except ImportError:  # pragma: no cover - Python < 3.9 fallback
+        et = timezone(timedelta(hours=-4))
+    start_et = datetime(
+        window_dates[0].year, window_dates[0].month, window_dates[0].day,
+        14, 0, tzinfo=et,
+    )
+    end_et = datetime(
+        window_dates[1].year, window_dates[1].month, window_dates[1].day,
+        14, 0, tzinfo=et,
+    )
+    return (
+        start_et.astimezone(timezone.utc),
+        end_et.astimezone(timezone.utc),
+    )
+
+
+def _parse_recent_listing_sections(content: str) -> dict[date_cls, list[str]]:
+    """Extract every dated section's IDs from an arXiv recent-listing page.
+
+    Sections are labelled with the date the mailing completes, which is the
+    digest (visible) date for that batch.  Returns {label_date: [ids,...]}.
+    """
+    sections: dict[date_cls, list[str]] = {}
     section_pattern = re.compile(
-        rf"<h3>{_WEEKDAYS[target.weekday()]}, (\d{{1,2}}) "
-        rf"{_MONTHS[target.month - 1]} {target.year} "
-        rf"\(showing \d+ of \d+ entries \)</h3>"
-        rf"(.*?)(?=</dl>)",
+        r"<h3>(\w{3}), (\d{1,2}) (\w{3}) (\d{4}) "
+        r"\(showing \d+ of \d+ entries?\s*\)</h3>(.*?)(?=</dl>)",
         re.DOTALL,
     )
-    for section_match in section_pattern.finditer(content):
-        if int(section_match.group(1)) != target.day:
-            continue
-        return re.findall(
-            r'href\s*=\s*["\']/abs/([0-9.]+)["\']',
-            section_match.group(2),
+    for m in section_pattern.finditer(content):
+        weekday_token, day, month_token, year = (
+            m.group(1), int(m.group(2)), m.group(3), int(m.group(4)),
         )
-    return None
+        if month_token not in _MONTHS:
+            continue
+        month = _MONTHS.index(month_token) + 1
+        try:
+            label = date_cls(year, month, day)
+        except ValueError:
+            continue
+        # Guard against a heading that names a different weekday than the date.
+        if _WEEKDAYS[label.weekday()] != weekday_token:
+            continue
+        ids = re.findall(r'href\s*=\s*["\']/abs/([0-9.]+)["\']', m.group(5))
+        sections[label] = ids
+    return sections
 
 
-def _fetch_recent_listing_ids(target_date: str) -> Optional[list[str]]:
-    """Fetch one recent astro-ph listing page under the shared limiter."""
+def _fetch_recent_listing() -> Optional[dict[date_cls, list[str]]]:
+    """Fetch and parse the astro-ph recent listing page.
+
+    Returns {label_date: [ids,...]} on success, or None when the page cannot
+    be fetched (network/proxy failure) so callers can fall back to the API.
+    """
     request = Request(
         _RECENT_LIST_URL,
         headers={"User-Agent": _ARXIV_USER_AGENT},
@@ -136,7 +235,7 @@ def _fetch_recent_listing_ids(target_date: str) -> Optional[list[str]]:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             with opener.open(request, timeout=30) as response:
                 content = response.read().decode("utf-8")
-    return _parse_recent_listing_ids(content, target_date)
+    return _parse_recent_listing_sections(content)
 
 
 def _paper_from_result(
@@ -253,72 +352,132 @@ def _fetch_listed_papers(
     ]
 
 
-def fetch_papers(
-    categories: list[str],
-    days: int = 1,
-    max_results: int = 500,
-    max_retries: int = 1,
-    include_cross: bool = True,
-    include_replacements: bool = True,
-    target_date: str = None,
-) -> list[dict]:
-    """Fetch recent papers from arxiv for the given categories.
+def resolve_daily_batch(
+    target_date: str,
+    now_local: Optional[datetime] = None,
+    available_after: Optional[time_cls] = None,
+) -> dict:
+    """Decide how to obtain the batch for digest date ``target_date``.
 
     Args:
-        categories: list of arxiv category strings, e.g. ["astro-ph.GA", "astro-ph.SR"]
-        days: number of past days to search
-        max_results: maximum number of results to return
-        max_retries: number of retry attempts on network failure
-        include_cross: include cross-listed papers
-        include_replacements: include replacement (updated) papers
-        target_date: specific date (YYYY-MM-DD) to fetch papers for
+        target_date: digest date YYYY-MM-DD (a visible date in the digest
+            timezone; the section the official listing labels with this date).
+        now_local: current time in the digest timezone (defaults to now UTC).
+        available_after: the digest-timezone clock time after which today's
+            batch is expected to have appeared (defaults to 10:00).
 
-    Returns:
-        list of dicts with keys: id, title, authors, abstract, categories,
-        published, pdf_url, entry, paper_type
+    Returns a dict with:
+        status: "ok" | "no_announcement" | "not_yet_available"
+                | "deferred_or_lagging" | "listing_unavailable"
+        ids: list of paper IDs (only when status == "ok")
+        et_announcement: the ET date of the 20:00 ET announcement
+        window_utc: (start, end) UTC submission-window cutoffs or None
+        message: human-readable explanation
     """
-    if target_date:
-        # The recent page is labelled with the announcement date in US Eastern
-        # time, which is one day earlier than the user's BJT digest date
-        # (announcements appear at 20:00 ET = 08:00 BJT the next day).
-        et_target_date = (
-            date_cls.fromisoformat(target_date) - timedelta(days=1)
-        ).isoformat()
-        try:
-            listed_ids = _fetch_recent_listing_ids(et_target_date)
-        except Exception as e:
-            # The official listing is an optimisation; a network failure here
-            # must not kill the run - fall back to the API query path.
-            print(f"  Recent listing unavailable ({e}); using API query fallback.")
-            listed_ids = None
-        if listed_ids is not None:
-            print(
-                f"  Official astro-ph listing: {len(listed_ids)} entries "
-                f"for {_recent_date_label(et_target_date)}"
-            )
-            try:
-                return _fetch_listed_papers(
-                    listed_ids,
-                    categories,
-                    include_cross,
-                    include_replacements,
-                )
-            except requests.exceptions.ProxyError:
-                print("  Proxy connection failed; retrying without the system proxy...")
-                return _fetch_listed_papers(
-                    listed_ids,
-                    categories,
-                    include_cross,
-                    include_replacements,
-                    trust_env=False,
-                )
+    now_local = now_local or datetime.now(timezone.utc)
+    available_after = available_after or _AVAILABLE_AFTER_DEFAULT
+    target = date_cls.fromisoformat(target_date)
+    # Announcement at 20:00 ET is visible at 08:00 the next day in the digest
+    # timezone; the calendar-date numbers coincide, so the ET announcement
+    # date is simply the day before the digest date.
+    et_announce = target - timedelta(days=1)
+    window_dates = _announcement_window_et(et_announce)
 
-    # Build query: (cat:astro-ph.GA OR cat:astro-ph.SR OR ...)
+    if window_dates is None:
+        return {
+            "status": "no_announcement",
+            "ids": None,
+            "et_announcement": et_announce,
+            "window_utc": None,
+            "message": (
+                f"{target} ({_WEEKDAYS[target.weekday()]}) has no arXiv "
+                "announcement: arXiv announces Sunday-Thursday only, so "
+                "nothing new becomes visible on BJT Saturday/Sunday."
+            ),
+        }
+
+    window_utc = _window_to_utc(window_dates)
+    sections = _fetch_recent_listing()
+
+    if sections is None:
+        return {
+            "status": "listing_unavailable",
+            "ids": None,
+            "et_announcement": et_announce,
+            "window_utc": window_utc,
+            "message": "Official astro-ph recent listing unavailable; using API fallback.",
+        }
+
+    if target in sections:
+        return {
+            "status": "ok",
+            "ids": sections[target],
+            "et_announcement": et_announce,
+            "window_utc": window_utc,
+            "message": f"Official astro-ph listing: {len(sections[target])} entries.",
+        }
+
+    if not sections or target < min(sections):
+        # The recent page keeps only the most recent announcement days; an
+        # older digest date must fall back to the API window query.
+        return {
+            "status": "listing_unavailable",
+            "ids": None,
+            "et_announcement": et_announce,
+            "window_utc": window_utc,
+            "message": (
+                f"Target date {target} is outside the recent-listing window "
+                f"({min(sections)}..{max(sections)}); using API fallback."
+            ),
+        }
+
+    # Target is inside the page's date window but has no section: either the
+    # batch has not been mailed yet today, or the announcement was deferred
+    # (US holiday, ad hoc arXiv deferral).
+    if target == now_local.date() and now_local.time() < available_after:
+        return {
+            "status": "not_yet_available",
+            "ids": None,
+            "et_announcement": et_announce,
+            "window_utc": window_utc,
+            "message": (
+                f"Today's ({target}) arXiv batch is not published yet "
+                f"(expected after {available_after.isoformat()}); do not write "
+                "a digest now."
+            ),
+        }
+    return {
+        "status": "deferred_or_lagging",
+        "ids": None,
+        "et_announcement": et_announce,
+        "window_utc": window_utc,
+        "message": (
+            f"No listing section for {target} ({_WEEKDAYS[target.weekday()]}); "
+            "the announcement was likely deferred (US holiday / arXiv status "
+            "page) or the listing lags."
+        ),
+    }
+
+
+def _fetch_api_window(
+    categories: list[str],
+    include_cross: bool,
+    include_replacements: bool,
+    cutoff_start: Optional[datetime],
+    cutoff_end: datetime,
+    max_results: int = 500,
+    max_retries: int = 1,
+) -> list[dict]:
+    """Fetch papers whose published/updated time falls in [cutoff_start, cutoff_end).
+
+    Used by the fallback path when the official listing cannot supply the
+    batch (page unreachable, or digest date older than the recent page).
+    """
     cat_query = " OR ".join(f"cat:{c}" for c in categories)
 
     client = _new_client()
     proxy_retried = False
-    effective_max = min(max_results, 300) if target_date else max_results
+    effective_max = max_results
 
     submitted_search = arxiv.Search(
         query=cat_query,
@@ -339,44 +498,205 @@ def fetch_papers(
             True,
         ))
 
-    # Determine date range for filtering
-    if target_date:
-        # Use arxiv announcement schedule to determine submission window
-        # Announcements at 20:00 ET; submissions received between prev_day 14:00 ET and target_day 14:00 ET
+    attempt = 0
+    while attempt < max_retries:
+        papers_by_id = {}
         try:
-            from zoneinfo import ZoneInfo
-            et = ZoneInfo("America/New_York")
-        except ImportError:
-            # Fallback: approximate ET as UTC-4 (EDT)
-            et = timezone(timedelta(hours=-4))
+            if attempt > 0:
+                wait = 30
+                print(
+                    f"  Waiting {wait}s before retry {attempt + 1}/{max_retries} "
+                    "after a network error..."
+                )
+                time.sleep(wait)
 
-        td = date_cls.fromisoformat(target_date)
-        # Shift back 1 day: user selects BJT date (when papers appear at 08:00 BJT),
-        # but the ET announcement date is 1 day earlier (20:00 ET previous day)
-        td = td - timedelta(days=1)
-        weekday = td.weekday()  # 0=Mon, 1=Tue, ..., 6=Sun
+            with _api_request_session():
+                for search, date_attribute, replacement_stream in searches:
+                    for result in client.results(search):
+                        result_date = getattr(result, date_attribute)
+                        if cutoff_start is not None:
+                            if result_date < cutoff_start:
+                                break
+                            if result_date >= cutoff_end:
+                                continue
+                        elif result_date < cutoff_end:
+                            break
 
-        # Determine how many days back the submission window starts
-        if weekday == 0:  # Monday announcement: Fri 14:00 - Mon 14:00 ET (3 days)
-            days_back = 3
-        elif weekday >= 5:  # Sat/Sun: no announcements, use Friday's window
-            days_back = 1  # Treat as Friday
-        else:  # Tue-Fri: previous day 14:00 ET
-            days_back = 1
+                        item = _paper_from_result(
+                            result,
+                            categories,
+                            include_cross,
+                            include_replacements,
+                            replacement_stream=replacement_stream,
+                        )
+                        if item is None:
+                            continue
+                        if item["base_id"] in papers_by_id:
+                            continue
+                        papers_by_id[item["base_id"]] = item["paper"]
+            break  # Success
+        except requests.exceptions.ProxyError:
+            if not proxy_retried:
+                # The system proxy is unreachable; retry immediately with a
+                # direct connection, without consuming the retry budget.
+                proxy_retried = True
+                print("  Proxy connection failed; retrying without the system proxy...")
+                client = _new_client(trust_env=False)
+                continue
+            raise
+        except arxiv.HTTPError as e:
+            if e.status == 429:
+                print("  arXiv API returned HTTP 429.")
+                print("  Stopping without automatic retries to avoid additional load.")
+                raise
+            else:
+                print(f"  arXiv API error (HTTP {e.status}): {e}")
+                if attempt == max_retries - 1:
+                    raise
+        except Exception as e:
+            print(f"  Error fetching papers: {e}")
+            if attempt == max_retries - 1:
+                raise
+        attempt += 1
 
-        # cutoff_end = target_date 14:00 ET (in UTC)
-        end_et = datetime(td.year, td.month, td.day, 14, 0, 0, tzinfo=et)
-        cutoff_end = end_et.astimezone(timezone.utc)
+    return list(papers_by_id.values())
 
-        # cutoff_start = (target_date - days_back) 14:00 ET (in UTC)
-        start_date = td - timedelta(days=days_back)
-        start_et = datetime(start_date.year, start_date.month, start_date.day, 14, 0, 0, tzinfo=et)
-        cutoff_start = start_et.astimezone(timezone.utc)
 
+def fetch_daily_batch(
+    categories: list[str],
+    include_cross: bool,
+    include_replacements: bool,
+    target_date: str,
+    now_local: Optional[datetime] = None,
+    available_after: Optional[time_cls] = None,
+) -> dict:
+    """Fetch the exact daily batch for digest date ``target_date``.
+
+    Prefers the official astro-ph recent listing (authoritative, handles
+    holiday deferrals automatically); falls back to an API window query when
+    the listing is unreachable or the date has scrolled off the recent page.
+
+    Returns {"status": ..., "papers": [...], "et_announcement": ...,
+    "window_utc": ..., "message": ...}.  Status is "ok" when papers were
+    fetched (possibly via fallback); otherwise one of "no_announcement",
+    "not_yet_available", "deferred_or_lagging" with an empty paper list.
+    """
+    resolved = resolve_daily_batch(
+        target_date, now_local=now_local, available_after=available_after,
+    )
+    if resolved["status"] == "ok":
+        try:
+            papers = _fetch_listed_papers(
+                resolved["ids"],
+                categories,
+                include_cross,
+                include_replacements,
+            )
+            return {
+                **resolved,
+                "status": "ok",
+                "papers": papers,
+                "message": (
+                    f"Official astro-ph listing: {len(resolved['ids'])} "
+                    f"entries for {_recent_date_label(target_date)}."
+                ),
+            }
+        except requests.exceptions.ProxyError:
+            print("  Proxy connection failed; retrying without the system proxy...")
+            papers = _fetch_listed_papers(
+                resolved["ids"],
+                categories,
+                include_cross,
+                include_replacements,
+                trust_env=False,
+            )
+            return {**resolved, "status": "ok", "papers": papers}
+
+    if resolved["status"] == "listing_unavailable":
+        cutoff_start, cutoff_end = resolved["window_utc"]
         print(f"  Submission window: {cutoff_start.isoformat()} to {cutoff_end.isoformat()}")
-    else:
-        cutoff_start = None
-        cutoff_end = datetime.now(timezone.utc) - timedelta(days=days)
+        papers = _fetch_api_window(
+            categories,
+            include_cross,
+            include_replacements,
+            cutoff_start,
+            cutoff_end,
+            max_results=500,
+        )
+        return {
+            **resolved,
+            "status": "ok",
+            "papers": papers,
+            "message": f"API fallback for {target_date}: {len(papers)} papers.",
+        }
+
+    # no_announcement / not_yet_available / deferred_or_lagging
+    return {**resolved, "papers": []}
+
+
+def fetch_papers(
+    categories: list[str],
+    days: int = 1,
+    max_results: int = 500,
+    max_retries: int = 1,
+    include_cross: bool = True,
+    include_replacements: bool = True,
+    target_date: str = None,
+) -> list[dict]:
+    """Fetch recent papers from arxiv for the given categories.
+
+    Args:
+        categories: list of arxiv category strings, e.g. ["astro-ph.GA", "astro-ph.SR"]
+        days: number of past days to search (used only without target_date)
+        max_results: maximum number of results to return
+        max_retries: number of retry attempts on network failure
+        include_cross: include cross-listed papers
+        include_replacements: include replacement (updated) papers
+        target_date: digest date (YYYY-MM-DD) - a visible date in the digest
+            timezone, i.e. the date the official listing labels the batch with
+
+    Returns:
+        list of dicts with keys: id, title, authors, abstract, categories,
+        published, pdf_url, entry, paper_type
+    """
+    if target_date:
+        result = fetch_daily_batch(
+            categories,
+            include_cross,
+            include_replacements,
+            target_date,
+            now_local=datetime.now(timezone.utc),
+            available_after=time_cls(0, 0),  # compat: no time-of-day guard
+        )
+        return result["papers"]
+
+    # Build query: (cat:astro-ph.GA OR cat:astro-ph.SR OR ...)
+    cat_query = " OR ".join(f"cat:{c}" for c in categories)
+
+    client = _new_client()
+    proxy_retried = False
+    effective_max = min(max_results, 300)
+
+    submitted_search = arxiv.Search(
+        query=cat_query,
+        max_results=effective_max,
+        sort_by=arxiv.SortCriterion.SubmittedDate,
+        sort_order=arxiv.SortOrder.Descending,
+    )
+    searches = [(submitted_search, "published", False)]
+    if include_replacements:
+        searches.append((
+            arxiv.Search(
+                query=cat_query,
+                max_results=effective_max,
+                sort_by=arxiv.SortCriterion.LastUpdatedDate,
+                sort_order=arxiv.SortOrder.Descending,
+            ),
+            "updated",
+            True,
+        ))
+
+    cutoff_end = datetime.now(timezone.utc) - timedelta(days=days)
 
     attempt = 0
     while attempt < max_retries:
@@ -394,12 +714,7 @@ def fetch_papers(
                 for search, date_attribute, replacement_stream in searches:
                     for result in client.results(search):
                         result_date = getattr(result, date_attribute)
-                        if target_date:
-                            if result_date < cutoff_start:
-                                break
-                            if result_date >= cutoff_end:
-                                continue
-                        elif result_date < cutoff_end:
+                        if result_date < cutoff_end:
                             break
 
                         item = _paper_from_result(

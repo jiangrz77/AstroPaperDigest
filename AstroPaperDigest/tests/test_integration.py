@@ -379,6 +379,81 @@ def test_full_pipeline_dry_run():
     print(f"  PASSED ({len(papers)} fetched -> {len(candidates)} candidates -> outputs generated)")
 
 
+def test_announcement_window_et():
+    """Test the arXiv submission-window mapping (current Sun-Thu schedule)."""
+    from datetime import date
+
+    from src.fetch_arxiv import _announcement_window_et
+
+    # 2026-08-16 is a Sunday (ET announcement): window Thu 08-13 .. Fri 08-14
+    assert _announcement_window_et(date(2026, 8, 16)) == (date(2026, 8, 13), date(2026, 8, 14))
+    # Monday announcement: Fri .. Mon
+    assert _announcement_window_et(date(2026, 8, 17)) == (date(2026, 8, 14), date(2026, 8, 17))
+    # Tue/Wed/Thu: previous day .. same day
+    assert _announcement_window_et(date(2026, 8, 18)) == (date(2026, 8, 17), date(2026, 8, 18))
+    assert _announcement_window_et(date(2026, 8, 19)) == (date(2026, 8, 18), date(2026, 8, 19))
+    assert _announcement_window_et(date(2026, 8, 20)) == (date(2026, 8, 19), date(2026, 8, 20))
+    # Friday/Saturday: no announcement
+    assert _announcement_window_et(date(2026, 8, 21)) is None
+    assert _announcement_window_et(date(2026, 8, 22)) is None
+    print("  PASSED (announcement windows for all weekdays)")
+
+
+def test_resolve_daily_batch():
+    """Test daily-batch resolution statuses without touching the network."""
+    from datetime import date, datetime, time as time_cls
+    from unittest.mock import patch
+    from zoneinfo import ZoneInfo
+
+    from src.fetch_arxiv import resolve_daily_batch
+
+    sections = {
+        date(2026, 8, 17): ["2608.14547"],
+        date(2026, 8, 18): ["2608.16841"],
+        date(2026, 8, 19): ["2608.18051"],
+    }
+    tz = ZoneInfo("Asia/Shanghai")
+    noon = datetime(2026, 8, 19, 11, 0, tzinfo=tz)
+    early = datetime(2026, 8, 19, 9, 0, tzinfo=tz)
+    avail = time_cls(10, 0)
+
+    with patch("src.fetch_arxiv._fetch_recent_listing", return_value=sections):
+        # Exact section match -> ok
+        r = resolve_daily_batch("2026-08-19", noon, avail)
+        assert r["status"] == "ok" and r["ids"] == ["2608.18051"], r
+        # BJT Saturday/Sunday -> no announcement
+        r = resolve_daily_batch("2026-08-22", noon, avail)
+        assert r["status"] == "no_announcement", r
+        r = resolve_daily_batch("2026-08-23", noon, avail)
+        assert r["status"] == "no_announcement", r
+        # Older than the recent-page window -> API fallback
+        r = resolve_daily_batch("2026-08-10", noon, avail)
+        assert r["status"] == "listing_unavailable", r
+    # Today's section missing before the availability time -> not yet available
+    with patch(
+        "src.fetch_arxiv._fetch_recent_listing",
+        return_value={d: v for d, v in sections.items() if d != date(2026, 8, 19)},
+    ):
+        r = resolve_daily_batch("2026-08-19", early, avail)
+        assert r["status"] == "not_yet_available", r
+        # ... but after the availability time with a missing section: deferred/lagging
+        r = resolve_daily_batch("2026-08-19", noon, avail)
+        assert r["status"] == "deferred_or_lagging", r
+    # Inside the window but missing -> deferred/lagging
+    with patch(
+        "src.fetch_arxiv._fetch_recent_listing",
+        return_value={d: v for d, v in sections.items() if d != date(2026, 8, 18)},
+    ):
+        r = resolve_daily_batch("2026-08-18", noon, avail)
+        assert r["status"] == "deferred_or_lagging", r
+    # Listing page unreachable -> API fallback with a window
+    with patch("src.fetch_arxiv._fetch_recent_listing", return_value=None):
+        r = resolve_daily_batch("2026-08-19", noon, avail)
+        assert r["status"] == "listing_unavailable", r
+        assert r["window_utc"] is not None, r
+    print("  PASSED (daily-batch resolution statuses)")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Arxiv Daily Recommender - Integration Tests")
@@ -389,6 +464,8 @@ if __name__ == "__main__":
         test_escape_bibtex,
         test_profile_extraction,
         test_filter,
+        test_announcement_window_et,
+        test_resolve_daily_batch,
         test_ranker_with_mock,
         test_ranker_none_response,
         test_ranker_markdown_wrapped_json,

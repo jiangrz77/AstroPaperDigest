@@ -8,8 +8,9 @@ and outputs BibTeX + Markdown digest.
 import argparse
 import os
 import sys
-from datetime import date
+from datetime import date, datetime, time as time_cls
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import yaml
 from dotenv import load_dotenv
@@ -21,7 +22,7 @@ load_dotenv(_PROJECT_DIR / ".env")
 os.chdir(_PROJECT_DIR)
 
 from src.profile import build_profile, build_profile_from_config
-from src.fetch_arxiv import fetch_papers
+from src.fetch_arxiv import fetch_daily_batch
 from src.filter import filter_papers
 from src.ranker import rank_papers
 from src.output import write_bibtex, write_digest, generate_markdown_digest
@@ -35,7 +36,50 @@ def load_config(config_path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def _write_empty_digest(digest_dir: str, reason: str, digest_date: str = None):
+def load_timezone_config(config: dict):
+    """Return (digest_tz, available_after) from config with safe defaults.
+
+    digest_tz: the timezone the digest date is expressed in (default
+        Asia/Shanghai).  available_after: the digest-timezone clock time after
+        which the day's arXiv batch is expected to be visible (default 10:00,
+        based on observed mailing completion).
+    """
+    tz_cfg = config.get("timezone", {}) or {}
+    tz_name = tz_cfg.get("digest", "Asia/Shanghai")
+    try:
+        digest_tz = ZoneInfo(tz_name)
+    except Exception:
+        print(f"  Warning: unknown timezone '{tz_name}', using Asia/Shanghai")
+        digest_tz = ZoneInfo("Asia/Shanghai")
+    available_after = time_cls(10, 0)
+    raw = str(tz_cfg.get("available_after", "10:00"))
+    try:
+        hh, mm = raw.split(":")
+        available_after = time_cls(int(hh), int(mm))
+    except Exception:
+        print(f"  Warning: invalid available_after '{raw}', using 10:00")
+    return digest_tz, available_after
+
+
+def holiday_note(config: dict, et_announcement) -> str:
+    """Return a note when an arXiv 2026 US holiday falls near the announcement.
+
+    The holiday list is informational only - fetching always follows the
+    official listing, which reflects actual (possibly deferred) mailings.
+    """
+    if et_announcement is None:
+        return ""
+    holidays = set(config.get("arxiv_schedule", {}).get("holidays_2026", []) or [])
+    hits = sorted(
+        h for h in holidays
+        if abs((date.fromisoformat(h) - et_announcement).days) <= 3
+    )
+    if hits:
+        return f"本周包含 arXiv 节假日（{', '.join(hits)}），公布批次可能顺延。"
+    return ""
+
+
+def _write_empty_digest(digest_dir: str, reason: str, digest_date: str = None, note: str = ""):
     """Write an empty digest file marking no papers available."""
     os.makedirs(digest_dir, exist_ok=True)
     d = digest_date or date.today().isoformat()
@@ -46,6 +90,8 @@ def _write_empty_digest(digest_dir: str, reason: str, digest_date: str = None):
 **Highly relevant (score >= 7):** 0
 **Status:** {reason}
 """
+    if note:
+        content += f"\n> 注：{note}\n"
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
     print(f"  Empty digest written to {path}")
@@ -129,9 +175,13 @@ def main():
         print(profile_to_prompt_text(profile))
         return
     
-    # Determine digest date in the user's local timezone
-    arxiv_date = args.target_date or date.today().isoformat()
-    print(f"  Digest date: {arxiv_date}")
+    # Digest date is a "visible date" in the configured digest timezone
+    # (default Asia/Shanghai): the day the announcement batch becomes visible
+    # at 08:00 local.  See src/fetch_arxiv.py for the schedule mapping.
+    digest_tz, available_after = load_timezone_config(config)
+    now_local = datetime.now(digest_tz)
+    arxiv_date = args.target_date or now_local.date().isoformat()
+    print(f"  Digest date: {arxiv_date} ({digest_tz})")
 
     # Step 2: Fetch papers
     print("\n[2/5] Fetching papers...")
@@ -146,16 +196,41 @@ def main():
     include_cross = not args.no_cross
     include_replacements = not args.no_replacements
     try:
-        papers = fetch_papers(
+        result = fetch_daily_batch(
             categories,
-            target_date=arxiv_date,
             include_cross=include_cross,
             include_replacements=include_replacements,
+            target_date=arxiv_date,
+            now_local=now_local,
+            available_after=available_after,
         )
     except Exception as e:
         print(f"ERROR: Failed to fetch papers from arXiv: {e}")
         print("Check your network/proxy settings and try again.")
         sys.exit(2)
+
+    status = result["status"]
+    if status == "not_yet_available":
+        # Before ~10:00 local the day's batch has not been mailed yet; do not
+        # write a (wrong or empty) digest for today.
+        print("NOT_YET_AVAILABLE")
+        print(f"  {result['message']}")
+        print(f"  今天的 arXiv 批次尚未公布（预计 {available_after.isoformat()} 后可见），未生成 digest。")
+        print("  请稍后重新运行，或为 --target-date 指定其他日期。")
+        return
+    if status in ("no_announcement", "deferred_or_lagging"):
+        # No announcement that day (BJT Saturday/Sunday, or a US-holiday /
+        # ad hoc deferral): record an explicit empty digest.
+        print("NO_ANNOUNCEMENT" if status == "no_announcement" else "DEFERRED_OR_LAGGING")
+        print(f"  {result['message']}")
+        note = holiday_note(config, result.get("et_announcement"))
+        if note:
+            print(f"  {note}")
+        digest_dir = output_cfg.get("digest_dir", "./output/digests")
+        _write_empty_digest(digest_dir, status, arxiv_date, note=note)
+        return
+
+    papers = result["papers"]
     print(f"  Fetched {len(papers)} papers")
     
     # Count paper types
