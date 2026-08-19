@@ -503,22 +503,28 @@ textarea{height:80px;resize:vertical}
 
   <div class="step">
     <h2><span class="step-num">3</span>Email Notification (Optional)</h2>
-    <label for="email_sender">Sender Email</label>
-    <input type="text" id="email_sender" name="email_sender" placeholder="you@example.com" value="{{ cur_email_sender or '' }}">
-    <label for="email_recipient">Recipient Email</label>
-    <input type="text" id="email_recipient" name="email_recipient" placeholder="you@example.com" value="{{ cur_email_recipient or '' }}">
-    <label for="smtp_server">SMTP Server</label>
-    <input type="text" id="smtp_server" name="smtp_server" placeholder="smtp.gmail.com" value="{{ cur_smtp_server or '' }}">
-    <label for="smtp_protocol">Protocol</label>
-    <select id="smtp_protocol" name="smtp_protocol" onchange="updatePort()">
-      <option value="starttls" {% if not cur_use_ssl %}selected{% endif %}>STARTTLS (port 587)</option>
-      <option value="ssl" {% if cur_use_ssl %}selected{% endif %}>SSL (port 465)</option>
-    </select>
-    <label for="smtp_port">Port (optional, auto-filled)</label>
-    <input type="text" id="smtp_port" name="smtp_port" placeholder="587" value="{{ cur_smtp_port or '587' }}">
-    <label for="email_password">Email Password / App Password</label>
-    <input type="password" id="email_password" name="email_password" placeholder="App password" value="{{ cur_email_password or '' }}">
-    <p class="hint">Leave all empty to skip email notifications.</p>
+    <label style="display:flex;align-items:center;gap:8px;font-weight:600;cursor:pointer">
+      <input type="checkbox" id="enable_email" name="enable_email" onchange="toggleEmail()" {% if cur_email_enabled %}checked{% endif %}>
+      Enable email notification
+    </label>
+    <p class="hint">Optional. Turn this on to receive the daily digest by email.</p>
+    <div id="email-fields" {% if not cur_email_enabled %}style="display:none"{% endif %}>
+      <label for="email_sender">Sender Email</label>
+      <input type="text" id="email_sender" name="email_sender" placeholder="you@example.com" value="{{ cur_email_sender or '' }}">
+      <label for="email_recipient">Recipient Email</label>
+      <input type="text" id="email_recipient" name="email_recipient" placeholder="you@example.com" value="{{ cur_email_recipient or '' }}">
+      <label for="smtp_server">SMTP Server</label>
+      <input type="text" id="smtp_server" name="smtp_server" placeholder="smtp.gmail.com" value="{{ cur_smtp_server or '' }}">
+      <label for="smtp_protocol">Protocol</label>
+      <select id="smtp_protocol" name="smtp_protocol" onchange="updatePort()">
+        <option value="starttls" {% if not cur_use_ssl %}selected{% endif %}>STARTTLS (port 587)</option>
+        <option value="ssl" {% if cur_use_ssl %}selected{% endif %}>SSL (port 465)</option>
+      </select>
+      <label for="smtp_port">Port (optional, auto-filled)</label>
+      <input type="text" id="smtp_port" name="smtp_port" placeholder="465" value="{{ cur_smtp_port or '465' }}">
+      <label for="email_password">Email Password / App Password</label>
+      <input type="password" id="email_password" name="email_password" placeholder="App password" value="{{ cur_email_password or '' }}">
+    </div>
   </div>
 
   <div class="step">
@@ -546,6 +552,10 @@ function toggleProfileMode() {
 function updatePort() {
   const proto = document.getElementById('smtp_protocol').value;
   document.getElementById('smtp_port').value = proto === 'ssl' ? '465' : '587';
+}
+function toggleEmail() {
+  const on = document.getElementById('enable_email').checked;
+  document.getElementById('email-fields').style.display = on ? '' : 'none';
 }
 </script>
 </body>
@@ -1152,8 +1162,9 @@ def setup_page():
         cur_email_sender=email_cfg.get("sender", ""),
         cur_email_recipient=email_cfg.get("recipient", ""),
         cur_smtp_server=email_cfg.get("smtp_server", ""),
-        cur_smtp_port=str(email_cfg.get("smtp_port", "587")),
-        cur_use_ssl=email_cfg.get("use_ssl", False),
+        cur_smtp_port=str(email_cfg.get("smtp_port", "465")),
+        cur_use_ssl=email_cfg.get("use_ssl", True),
+        cur_email_enabled=email_cfg.get("enabled", False),
         cur_email_password=env_vars.get("EMAIL_APP_PASSWORD", ""),
     )
 
@@ -1171,10 +1182,11 @@ def setup_submit():
     categories = request.form.getlist("categories")
     keywords_raw = request.form.get("keywords", "").strip()
     bib_path = request.form.get("bib_path", "").strip()
+    enable_email = request.form.get("enable_email") == "on"
     email_sender = request.form.get("email_sender", "").strip()
     email_recipient = request.form.get("email_recipient", "").strip()
     smtp_server = request.form.get("smtp_server", "").strip()
-    smtp_protocol = request.form.get("smtp_protocol", "starttls")
+    smtp_protocol = request.form.get("smtp_protocol", "ssl")
     smtp_port_value = request.form.get("smtp_port", "").strip()
     email_password = request.form.get("email_password", "").strip()
 
@@ -1193,25 +1205,39 @@ def setup_submit():
     if not model:
         abort(400, "Model name is required.")
 
-    try:
-        smtp_port = int(smtp_port_value) if smtp_port_value else (
-            465 if smtp_protocol == "ssl" else 587
-        )
-    except ValueError:
-        abort(400, "SMTP port must be an integer.")
-    if not 1 <= smtp_port <= 65535:
-        abort(400, "SMTP port must be between 1 and 65535.")
+    # Only parse/validate SMTP settings when email notification is enabled.
+    smtp_port = 465 if smtp_protocol == "ssl" else 587
+    if enable_email:
+        try:
+            smtp_port = int(smtp_port_value) if smtp_port_value else (
+                465 if smtp_protocol == "ssl" else 587
+            )
+        except ValueError:
+            abort(400, "SMTP port must be an integer.")
+        if not 1 <= smtp_port <= 65535:
+            abort(400, "SMTP port must be between 1 and 65535.")
 
-    # Write .env file
+    # Write .env file.  Preserve existing entries (other provider keys and
+    # any previously saved email values) and only update what this submission
+    # changes, so disabling email doesn't wipe credentials.
     env_path = os.path.join(_PROJECT_DIR, ".env")
-    env_values = {
-        api_key_env: api_key,
-        "EMAIL_APP_PASSWORD": email_password,
-        "EMAIL_SENDER": email_sender,
-        "EMAIL_RECIPIENT": email_recipient or email_sender,
-        "SMTP_SERVER": smtp_server,
-        "SMTP_PORT": str(smtp_port),
-    }
+    env_values = {}
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env_values[k.strip()] = v.strip().strip('"').strip("'")
+
+    env_values[api_key_env] = api_key
+    if enable_email:
+        env_values["EMAIL_APP_PASSWORD"] = email_password
+        env_values["EMAIL_SENDER"] = email_sender
+        env_values["EMAIL_RECIPIENT"] = email_recipient or email_sender
+        env_values["SMTP_SERVER"] = smtp_server
+        env_values["SMTP_PORT"] = str(smtp_port)
+
     with open(env_path, "w", encoding="utf-8") as f:
         for key, value in env_values.items():
             escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
@@ -1250,7 +1276,7 @@ def setup_submit():
             config["bib_file"] = bib_path
 
     # Update email config
-    if email_sender and smtp_server:
+    if enable_email and email_sender and smtp_server:
         config["email"]["enabled"] = True
         config["email"]["sender"] = email_sender
         config["email"]["recipient"] = email_recipient or email_sender
@@ -1259,8 +1285,8 @@ def setup_submit():
         config["email"]["smtp_port"] = smtp_port
         config["email"]["password_env"] = "EMAIL_APP_PASSWORD"
     else:
-        # Leaving the email section empty should disable notifications,
-        # not keep stale default credentials active.
+        # Email disabled (or incomplete): turn notifications off without
+        # wiping previously saved credentials.
         config["email"]["enabled"] = False
 
     # Write updated config
