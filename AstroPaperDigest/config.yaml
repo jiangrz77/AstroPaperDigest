@@ -1,10 +1,10 @@
 arxiv_categories:
-- astro-ph.CO
-- astro-ph.EP
 - astro-ph.GA
-- astro-ph.HE
-- astro-ph.IM
 - astro-ph.SR
+- astro-ph.HE
+- astro-ph.CO
+- astro-ph.IM
+- astro-ph.EP
 keywords:
 - first stars
 - Population III
@@ -78,25 +78,17 @@ email:
 filter:
   max_candidates_for_llm: 80
   score_threshold: 7
-# 日期口径与 arXiv 时间表（详见 src/fetch_arxiv.py 头注释）
 timezone:
-  # digest 日期采用"可见日"：北京时间看到该批论文的日期
-  # （arXiv 20:00 ET 公布 = 次日 08:00 BJT 可见；listing 区块标签=可见日）
   digest: Asia/Shanghai
-  # 当日批次预计可见时刻（digest 时区；实测约 10:00，理论 08:00 存在波动）
-  available_after: "10:00"
+  available_after: '10:01'
 arxiv_schedule:
-  # 公布时间表（当前官方规则，2021 年 10 月起生效）：
-  #   周日-周四 20:00 ET 公布；周五/周六不公布
-  #   窗口：周日←[周四,周五)14:00 ET；周一←[周五,周一)；周二-周四←[前一日,当日)
-  # 节假日仅用于 digest 备注提示；取数永远以官方 listing 页面为准
   holidays_2026:
-    - "2026-01-01"
-    - "2026-01-19"
-    - "2026-06-19"
-    - "2026-07-03"
-    - "2026-09-07"
-    - "2026-11-26"
-    - "2026-12-25"
-    - "2026-12-29"
-    - "2026-12-31"
+  - '2026-01-01'
+  - '2026-01-19'
+  - '2026-06-19'
+  - '2026-07-03'
+  - '2026-09-07'
+  - '2026-11-26'
+  - '2026-12-25'
+  - '2026-12-29'
+  - '2026-12-31'
