@@ -68,10 +68,10 @@ output:
   bibtex_dir: ./output/bibtex
   digest_dir: ./output/digests
 email:
-  enabled: true
+  enabled: false
   smtp_server: mail.cstnet.cn
-  smtp_port: 587
-  use_ssl: false
+  smtp_port: 465
+  use_ssl: true
   sender: rzjiang@pmo.ac.cn
   recipient: rzjiang@pmo.ac.cn
   password_env: EMAIL_APP_PASSWORD
