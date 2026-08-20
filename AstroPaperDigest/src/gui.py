@@ -1994,8 +1994,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .card{background:#fff;border-radius:10px;padding:18px 20px;margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,.08);transition:box-shadow .2s}
 .card:hover{box-shadow:0 3px 12px rgba(0,0,0,.12)}
 .card-title{font-size:15px;font-weight:600;color:#2c3e50;margin-bottom:6px;display:flex;align-items:flex-start;gap:10px}
-.score-badge{display:inline-block;min-width:82px;text-align:center;padding:3px 8px;border-radius:12px;font-size:12px;font-weight:700;letter-spacing:1px;color:#fff;flex-shrink:0}
-.score-strong{background:#d97706}.score-high{background:#27ae60}.score-mid{background:#2563eb}.score-low{background:#95a5a6}.score-failed{background:#dc2626;letter-spacing:0}
+.score-badge{display:inline-block;min-width:82px;text-align:center;padding:3px 8px;border-radius:12px;background:#fff;font-size:15px;font-weight:700;letter-spacing:1px;line-height:1;color:#cbd5e1;flex-shrink:0}
+.score-strong{color:#f4b400}.score-high{color:#27ae60}.score-mid{color:#2563eb}.score-low{color:#95a5a6}.score-failed{background:#dc2626;color:#fff;font-size:12px;letter-spacing:0}
+.stars-empty{color:#d7dde5}
 .adj-badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:700;flex-shrink:0}
 .adj-pos{background:#e8f5e9;color:#2e7d32}
 .adj-neg{background:#fdecea;color:#c62828}
@@ -2114,7 +2115,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
       {% if paper.scoring_failed %}
       <span class="score-badge score-failed">No score</span>
       {% else %}
-      <span class="score-badge {% if paper.score == 5 %}score-strong{% elif paper.score == 4 %}score-high{% elif paper.score >= 2 %}score-mid{% else %}score-low{% endif %}" data-role="score" aria-label="{{ paper.score }} out of 5 stars">{{ star_display(paper.score) }}</span>
+      <span class="score-badge {% if paper.score == 5 %}score-strong{% elif paper.score == 4 %}score-high{% elif paper.score >= 2 %}score-mid{% else %}score-low{% endif %}" data-role="score" aria-label="{{ paper.score }} out of 5 stars"><span class="stars-filled">{{ '★' * paper.score }}</span><span class="stars-empty">{{ '☆' * (5 - paper.score) }}</span></span>
       {% if paper.score_adjustment %}<span class="adj-badge {% if paper.score_adjustment > 0 %}adj-pos{% else %}adj-neg{% endif %}" title="Preference adjustment (relative to LLM raw score)">{{ '%+.1f' | format(paper.score_adjustment) }}</span>{% endif %}
       {% endif %}
       <span>{{ paper.title }}</span>
@@ -2232,7 +2233,7 @@ function moveCardToTier(card, score) {
 function updateCardScore(card, score) {
   const badge = card.querySelector('[data-role="score"]');
   if (!badge) return;
-  badge.textContent = '★'.repeat(score) + '☆'.repeat(5 - score);
+  badge.innerHTML = '<span class="stars-filled">' + '★'.repeat(score) + '</span><span class="stars-empty">' + '☆'.repeat(5 - score) + '</span>';
   badge.setAttribute('aria-label', score + ' out of 5 stars');
   badge.classList.remove('score-strong', 'score-high', 'score-mid', 'score-low');
   badge.classList.add(score === 5 ? 'score-strong' : (score === 4 ? 'score-high' : (score >= 2 ? 'score-mid' : 'score-low')));
