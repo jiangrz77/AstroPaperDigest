@@ -10,6 +10,8 @@
 #   PYTHON=... ./build_dmg.sh        override the python that has PyInstaller
 #
 # Requires: macOS, a python3 with PyInstaller (e.g. pip install pyinstaller).
+# Recommend Python 3.12+ (OpenSSL 3.x): older CPythons bundle LibreSSL 2.8.x
+# which intermittently fails TLS against modern hosts.
 set -euo pipefail
 cd "$(dirname "$0")"
 APP_ROOT="$(pwd)"

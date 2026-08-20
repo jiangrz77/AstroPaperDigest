@@ -15,8 +15,20 @@ directory from __file__.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+# In frozen (PyInstaller) builds the interpreter's baked-in default CA bundle
+# points at the build machine and does not exist here, so stdlib urllib fails
+# with CERTIFICATE_VERIFY_FAILED.  Point it at the certifi bundle that ships
+# inside the app (harmless in source mode too).
+try:
+    import certifi
+
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+except Exception:
+    pass
 
 _APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "AstroPaperDigest"
 
