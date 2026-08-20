@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 from collections import deque
-from datetime import date, datetime
+from datetime import date, datetime, time as datetime_time
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread, Timer
@@ -52,6 +52,11 @@ from src.scoring import apply_source_adjustment, feedback_step, score_to_stars
 
 FEEDBACK_FILE = os.path.join(_PROJECT_DIR, "feedback.json")
 PREFERENCES_FILE = os.path.join(_PROJECT_DIR, "preferences.json")
+
+_NOT_YET_AVAILABLE_MESSAGE = (
+    "Today's arXiv batch has not been updated yet.\n"
+    "It is usually updated around 10:00 (GMT+8)."
+)
 
 # Static assets are read from the source tree during development and from the
 # PyInstaller bundle in the installed app. User data remains in _PROJECT_DIR.
@@ -559,6 +564,7 @@ def load_preferences() -> dict:
         "last_viewed_date": "",
         "auto_check_updates": True,
         "dismissed_update_version": "",
+        "auto_fetch_attempts": {},
     }
     if os.path.exists(PREFERENCES_FILE):
         try:
@@ -792,7 +798,7 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
             _pipeline_progress.update({"stage": "done", "done": 1, "total": 1})
             # Set contextual message based on result
             if "NOT_YET_AVAILABLE" in stdout:
-                _pipeline_message = "Today's batch is not published yet (expected after ~10:00); no digest generated."
+                _pipeline_message = _NOT_YET_AVAILABLE_MESSAGE
             elif "NO_ANNOUNCEMENT" in stdout:
                 _pipeline_message = "No arXiv announcement on this day (weekend/holiday deferral); an empty digest was generated."
             elif "DEFERRED_OR_LAGGING" in stdout:
@@ -805,7 +811,7 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
                 if _current_digest and _current_digest["total_papers"] == 0:
                     status = _current_digest.get("status", "no_papers")
                     if status == "no_papers":
-                        _pipeline_message = "No available papers (arxiv has not been updated yet)."
+                        _pipeline_message = _NOT_YET_AVAILABLE_MESSAGE
                     elif status == "no_new_papers":
                         _pipeline_message = "No new papers since last digest."
                     elif status == "no_matches":
@@ -856,6 +862,7 @@ def _start_pipeline(
     include_cross: bool = True,
     include_replacements: bool = True,
     target_date: str = "",
+    automatic: bool = False,
 ) -> bool:
     """Start at most one pipeline process."""
     global _pipeline_status, _pipeline_message, _pipeline_batch_summary, _pipeline_cancel_requested
@@ -863,6 +870,16 @@ def _start_pipeline(
     with _pipeline_lock:
         if _pipeline_status == "running":
             return False
+        if automatic:
+            auto_date = target_date or _digest_today_str()
+            allowed, reason = _automatic_fetch_gate(auto_date)
+            if not allowed:
+                _pipeline_status = "done"
+                _pipeline_message = reason
+                return False
+            # Record before launching the process so a restart or a second
+            # request cannot start another automatic fetch for this date.
+            _record_automatic_fetch_attempt(auto_date)
         _pipeline_status = "running"
         _pipeline_cancel_requested = False
         _pipeline_message = "[1/5] Starting pipeline..."
@@ -2641,6 +2658,9 @@ _ARXIV_HOLIDAYS_2026 = {
     "2026-09-07", "2026-11-26", "2026-12-25", "2026-12-29", "2026-12-31",
 }
 
+_AUTO_FETCH_TIMEZONE = "Asia/Shanghai"
+_AUTO_FETCH_AFTER = datetime_time(10, 0)
+
 def _digest_today_str() -> str:
     """Today's date in the configured digest timezone (config.yaml)."""
     try:
@@ -2652,6 +2672,49 @@ def _digest_today_str() -> str:
         return datetime.now(ZoneInfo(tz_name)).date().isoformat()
     except Exception:
         return date.today().isoformat()
+
+
+def _auto_fetch_now() -> datetime:
+    """Return the current time in the fixed GMT+8 auto-fetch timezone."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(_AUTO_FETCH_TIMEZONE))
+    except Exception:
+        # Asia/Shanghai is available on normal Python installations. Keep a
+        # safe fallback for unusual embedded runtimes without timezone data.
+        return datetime.now()
+
+
+def _automatic_fetch_gate(date_str: str) -> tuple[bool, str]:
+    """Check whether today's one-time automatic fetch may start."""
+    now = _auto_fetch_now()
+    if date_str != now.date().isoformat():
+        return False, "Automatic fetch is available only for today's date."
+    if now.time() < _AUTO_FETCH_AFTER:
+        return False, _NOT_YET_AVAILABLE_MESSAGE
+
+    prefs = load_preferences()
+    attempts = prefs.get("auto_fetch_attempts", {})
+    if isinstance(attempts, dict) and date_str in attempts:
+        return False, "Today's automatic fetch has already been checked. No new digest is available yet."
+    return True, ""
+
+
+def _record_automatic_fetch_attempt(date_str: str) -> None:
+    """Persist an automatic fetch attempt before starting its process."""
+    prefs = load_preferences()
+    attempts = prefs.get("auto_fetch_attempts", {})
+    if not isinstance(attempts, dict):
+        attempts = {}
+    attempts[date_str] = {
+        "attempted_at": _auto_fetch_now().isoformat(),
+    }
+    # Keep the preference file bounded while retaining enough history for
+    # navigation and diagnostics.
+    for old_date in sorted(attempts)[:-90]:
+        attempts.pop(old_date, None)
+    prefs["auto_fetch_attempts"] = attempts
+    save_preferences(prefs)
 
 
 def _is_arxiv_update_day(date_str: str) -> bool:
@@ -2801,7 +2864,7 @@ def _render_digest(digest=None):
         elif status == "deferred_or_lagging":
             msg = "This day's batch may be deferred (holiday) or the listing lags; no content yet"
         elif is_today and status == "no_papers":
-            msg = "No available papers (today's arxiv has not been updated yet)"
+            msg = _NOT_YET_AVAILABLE_MESSAGE
         elif is_today and status == "no_new_papers":
             msg = "No new papers since last digest"
         else:
@@ -2942,11 +3005,13 @@ def index():
             return _render_digest(digest)
     # Nothing available
     today_str = _digest_today_str()
+    _, auto_message = _automatic_fetch_gate(today_str)
     return render_template_string(
         NO_DIGEST_TEMPLATE,
         selected_date=today_str,
         today_str=today_str,
         available_dates=available,
+        custom_message=auto_message,
         is_update_day=_is_arxiv_update_day(today_str)
     )
 
@@ -2986,11 +3051,22 @@ def digest_by_date(date_str):
     # Auto-run pipeline if navigating to today and no digest exists yet
     if date_str == today_str:
         prefs = load_preferences()
-        _start_pipeline(
+        started = _start_pipeline(
             include_cross=prefs.get("include_cross", True),
             include_replacements=prefs.get("include_replacements", True),
+            target_date=date_str,
+            automatic=True,
         )
-        return render_template_string(STATUS_PAGE, display_date=date_str, today_str=today_str)
+        if started or _pipeline_status == "running":
+            return render_template_string(STATUS_PAGE, display_date=date_str, today_str=today_str)
+        return render_template_string(
+            NO_DIGEST_TEMPLATE,
+            selected_date=date_str,
+            available_dates=available,
+            today_str=today_str,
+            custom_message=_pipeline_message,
+            is_update_day=_is_arxiv_update_day(date_str),
+        )
     return render_template_string(
         NO_DIGEST_TEMPLATE,
         selected_date=date_str,
@@ -3417,7 +3493,9 @@ def main():
     if digest_path and os.path.exists(digest_path):
         _current_digest = parse_digest(digest_path)
 
-    # Only auto-run pipeline if today's digest doesn't exist
+    # Automatically check today's batch at most once, and only after the
+    # arXiv publication window opens in GMT+8. Manual Regenerate remains
+    # available through /run.
     today_str = _digest_today_str()
     today_digest = os.path.join(str(_PROJECT_DIR), "output", "digests", f"digest_{today_str}.md")
     has_today = os.path.exists(today_digest)
@@ -3427,6 +3505,8 @@ def main():
         _start_pipeline(
             include_cross=prefs.get("include_cross", True),
             include_replacements=prefs.get("include_replacements", True),
+            target_date=today_str,
+            automatic=True,
         )
     else:
         _pipeline_status = "done"
