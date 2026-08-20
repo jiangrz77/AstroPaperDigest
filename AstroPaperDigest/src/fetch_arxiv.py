@@ -329,8 +329,9 @@ def _fetch_listed_papers(
     client = _new_client(trust_env=trust_env)
     papers_by_id = {}
     total_ids = len(ids)
-    fetched = 0
-    emit("fetch", 0, total_ids, f"Fetching arXiv papers… ({total_ids} total)")
+    requested_ids = {re.sub(r"v\d+$", "", paper_id) for paper_id in ids}
+    returned_ids = set()
+    emit("fetch", 0, total_ids, f"Fetching metadata for {total_ids} official arXiv papers…")
 
     for start in range(0, len(ids), _ID_LIST_BATCH_SIZE):
         batch = ids[start:start + _ID_LIST_BATCH_SIZE]
@@ -344,20 +345,23 @@ def _fetch_listed_papers(
                             raise requests.exceptions.Timeout(
                                 f"arXiv batch timed out after {_FETCH_BATCH_TIMEOUT}s"
                             )
+                        result_id = re.sub(r"v\d+$", "", result.entry_id.split("/")[-1])
+                        if result_id in requested_ids:
+                            returned_ids.add(result_id)
                         item = _paper_from_result(
                             result,
                             categories,
                             include_cross,
                             include_replacements,
                         )
-                        if item is None:
-                            continue
-                        if item["base_id"] not in papers_by_id:
+                        if item is not None and item["base_id"] not in papers_by_id:
                             papers_by_id[item["base_id"]] = item["paper"]
-                            fetched += 1
-                            if fetched % 5 == 0 or fetched == total_ids:
-                                emit("fetch", fetched, total_ids,
-                                     f"Fetched {fetched}/{total_ids} arXiv papers…")
+                        if len(returned_ids) % 5 == 0 or len(returned_ids) == total_ids:
+                            emit(
+                                "fetch", len(returned_ids), total_ids,
+                                f"Fetched metadata for {len(returned_ids)}/{total_ids} official papers; "
+                                f"{len(papers_by_id)} match selected categories…",
+                            )
                 break
             except requests.exceptions.ProxyError:
                 if trust_env and attempt == 0:
@@ -380,11 +384,15 @@ def _fetch_listed_papers(
                     continue
                 raise
 
-    # arXiv's id_list API intermittently omits some listed IDs; retry any
-    # missing ones individually so the official listing count is honoured.
-    missing = [i for i in ids if i not in papers_by_id]
+    # arXiv's id_list API intermittently omits some listed IDs; retry only
+    # IDs absent from the API response, not papers intentionally removed by
+    # the user's category/replacement preferences.
+    missing = [
+        paper_id for paper_id in ids
+        if re.sub(r"v\d+$", "", paper_id) not in returned_ids
+    ]
     if missing:
-        print(f"  {len(missing)} listed paper(s) missing from the batch response; "
+        print(f"  {len(missing)} metadata record(s) missing from the batch response; "
               "retrying individually ...")
         for i in missing:
             try:
@@ -395,6 +403,9 @@ def _fetch_listed_papers(
                             raise requests.exceptions.Timeout(
                                 f"single-id arXiv query timed out after {_FETCH_BATCH_TIMEOUT}s"
                             )
+                        result_id = re.sub(r"v\d+$", "", result.entry_id.split("/")[-1])
+                        if result_id in requested_ids:
+                            returned_ids.add(result_id)
                         item = _paper_from_result(
                             result,
                             categories,
@@ -406,10 +417,15 @@ def _fetch_listed_papers(
             except Exception:
                 pass
 
+    emit(
+        "fetch", len(returned_ids), total_ids,
+        f"Fetched metadata for {len(returned_ids)}/{total_ids} official papers; "
+        f"{len(papers_by_id)} match selected categories.",
+    )
     return [
-        papers_by_id[paper_id]
+        papers_by_id[re.sub(r"v\d+$", "", paper_id)]
         for paper_id in ids
-        if paper_id in papers_by_id
+        if re.sub(r"v\d+$", "", paper_id) in papers_by_id
     ]
 
 
