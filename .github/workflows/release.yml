@@ -38,9 +38,7 @@ jobs:
             echo "## Checksums (SHA-256)"
             # .app.zip FIRST: the in-app updater verifies against the first
             # SHA-256 it finds in the release body.
-            for f in AstroPaperDigest/dist/AstroPaperDigest-v*.app.zip \
-                     AstroPaperDigest/dist/AstroPaperDigest-*.dmg \
-                     AstroPaperDigest/dist/AstroPaperDigest-v*.source.zip; do
+            for f in AstroPaperDigest/dist/AstroPaperDigest-*.dmg; do
               echo "- $(basename "$f")"
               echo "  SHA256: $(shasum -a 256 "$f" | awk '{print $1}')"
             done
@@ -51,9 +49,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           body_path: /tmp/release-body.md
+          # dmg-only release (in-app whole-bundle updates are not shipped yet)
           files: |
             AstroPaperDigest/dist/AstroPaperDigest-*.dmg
-            AstroPaperDigest/dist/AstroPaperDigest-v*.app.zip
-            AstroPaperDigest/dist/AstroPaperDigest-v*.source.zip
-            AstroPaperDigest/dist/version.json
-            AstroPaperDigest/dist/SHA256SUMS
