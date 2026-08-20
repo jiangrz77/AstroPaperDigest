@@ -2139,20 +2139,7 @@ function showScopeBanner() {
 }
 showScopeBanner();
 function applyCategoryDisplay() {
-  const selected = Array.from(document.querySelectorAll('.digest-category:checked')).map(function (input) { return input.value; });
-  document.querySelectorAll('.card[data-categories]').forEach(function (card) {
-    const categories = String(card.dataset.categories || '').split(',').map(function (item) { return item.trim(); });
-    card.style.display = selected.length === 0 || categories.some(function (category) { return selected.indexOf(category) >= 0; }) ? '' : 'none';
-  });
-  document.querySelectorAll('[id^="tier-"]').forEach(function (header) {
-    const cards = [];
-    let node = header.nextElementSibling;
-    while (node && !node.id?.startsWith('tier-')) { if (node.classList.contains('card')) cards.push(node); node = node.nextElementSibling; }
-    const visible = cards.filter(function (card) { return card.style.display !== 'none'; }).length;
-    const count = header.querySelector('.tier-count');
-    if (count) count.textContent = visible;
-    header.style.display = visible ? '' : 'none';
-  });
+  filterCards();
 }
 document.querySelectorAll('.digest-category').forEach(function (input) { input.addEventListener('change', applyCategoryDisplay); });
 applyCategoryDisplay();
@@ -2160,17 +2147,7 @@ function tierKey(score) {
   return score >= 7 ? 'high' : (score >= 5 ? 'medium' : 'low');
 }
 function updateTierCounts() {
-  document.querySelectorAll('.tier-header').forEach(function (header) {
-    let node = header.nextElementSibling, count = 0;
-    while (node && !node.classList.contains('tier-header')) {
-      if (node.classList.contains('card') && node.style.display !== 'none') count += 1;
-      node = node.nextElementSibling;
-    }
-    const countEl = header.querySelector('.tier-count');
-    if (countEl) countEl.textContent = count;
-    const nav = document.querySelector('.btn-nav[data-tier-key="' + header.dataset.tier + '"] .btn-tier-count');
-    if (nav) nav.textContent = count;
-  });
+  refreshVisibleCounts();
 }
 function moveCardToTier(card, score) {
   const key = tierKey(score);
@@ -2313,39 +2290,48 @@ function countVisibleBetween(tier, nextTier) {
 function filterCards() {
   const includeCross = document.getElementById('chk-cross').checked;
   const includeRepl = document.getElementById('chk-repl').checked;
+  const selectedCategories = Array.from(document.querySelectorAll('.digest-category:checked'))
+    .map(function (input) { return input.value; });
   
   const allCards = document.querySelectorAll('.card');
-  let totalVisible = 0;
   
   allCards.forEach(card => {
     const type = card.dataset.paperType || 'new';
-    let show = true;
+    const categories = String(card.dataset.categories || '').split(',').map(function (item) { return item.trim(); });
+    let show = selectedCategories.length === 0 || categories.some(function (category) {
+      return selectedCategories.indexOf(category) >= 0;
+    });
     
     if (type === 'cross' && !includeCross) show = false;
     if (type === 'replacement' && !includeRepl) show = false;
     
     card.style.display = show ? '' : 'none';
-    if (show) totalVisible++;
   });
-  
-  // Update tier counts by iterating siblings
+
+  refreshVisibleCounts();
+}
+
+function refreshVisibleCounts() {
   const tierHeaders = document.querySelectorAll('.tier-header');
+  let totalVisible = 0;
   tierHeaders.forEach((tier, idx) => {
     const nextTier = tierHeaders[idx + 1];
     const visibleCount = countVisibleBetween(tier, nextTier);
+    totalVisible += visibleCount;
     const countEl = tier.querySelector('.tier-count');
     if (countEl) countEl.textContent = visibleCount;
-    // Also update toolbar button count
-    const btnCount = document.querySelector(`.btn-nav[data-tier-idx="${idx}"] .btn-tier-count`);
+    tier.style.display = visibleCount ? '' : 'none';
+    const btnCount = document.querySelector(`.btn-nav[data-tier-key="${tier.dataset.tier}"] .btn-tier-count`);
     if (btnCount) btnCount.textContent = visibleCount;
   });
-  
-  // Update total + highly-relevant stat from the visible tier counts, so the
-  // header numbers stay consistent with the filtered cards.
+
+  // Keep the header summary in sync with the cards actually visible after
+  // category, cross-list and replacement filters are all applied.
   const statsEl = document.querySelector('.stats');
   if (statsEl) {
-    const firstTier = tierHeaders[0];
-    const visibleHighly = firstTier ? countVisibleBetween(firstTier, tierHeaders[1] || null) : 0;
+    const highTier = document.querySelector('.tier-header[data-tier="high"]');
+    const highIndex = Array.prototype.indexOf.call(tierHeaders, highTier);
+    const visibleHighly = highTier ? countVisibleBetween(highTier, tierHeaders[highIndex + 1] || null) : 0;
     statsEl.innerHTML = `Total: ${totalVisible} papers &nbsp;|&nbsp; Highly relevant: ${visibleHighly}`;
   }
 }
