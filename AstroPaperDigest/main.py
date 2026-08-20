@@ -28,6 +28,7 @@ from src.ranker import rank_papers
 from src.output import write_bibtex, write_digest, generate_markdown_digest
 from src.notifier import send_digest_email
 from src.digest_parser import parse_digest, get_latest_digest_path
+from src.progress import emit
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
@@ -75,7 +76,7 @@ def holiday_note(config: dict, et_announcement) -> str:
         if abs((date.fromisoformat(h) - et_announcement).days) <= 3
     )
     if hits:
-        return f"本周包含 arXiv 节假日（{', '.join(hits)}），公布批次可能顺延。"
+        return f"This week includes an arXiv holiday ({', '.join(hits)}); the batch may be deferred."
     return ""
 
 
@@ -91,7 +92,7 @@ def _write_empty_digest(digest_dir: str, reason: str, digest_date: str = None, n
 **Status:** {reason}
 """
     if note:
-        content += f"\n> 注：{note}\n"
+        content += f"\n> Note: {note}\n"
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
     print(f"  Empty digest written to {path}")
@@ -157,6 +158,7 @@ def main():
     
     # Step 1: Build interest profile
     print("[1/5] Building interest profile...")
+    emit("profile", 1, 1, "Building interest profile…")
     bib_path = config.get("bib_file", "")
     if bib_path and os.path.exists(bib_path):
         profile = build_profile(bib_path)
@@ -185,6 +187,7 @@ def main():
 
     # Step 2: Fetch papers
     print("\n[2/5] Fetching papers...")
+    emit("fetch", 0, 0, "Contacting arXiv…")
     categories = config.get("arxiv_categories", [
         "astro-ph.CO",
         "astro-ph.EP",
@@ -215,8 +218,8 @@ def main():
         # write a (wrong or empty) digest for today.
         print("NOT_YET_AVAILABLE")
         print(f"  {result['message']}")
-        print(f"  今天的 arXiv 批次尚未公布（预计 {available_after.isoformat()} 后可见），未生成 digest。")
-        print("  请稍后重新运行，或为 --target-date 指定其他日期。")
+        print(f"  Today's arXiv batch is not published yet (expected after {available_after.isoformat()}); no digest generated.")
+        print("  Please re-run later, or pass --target-date with another date.")
         return
     if status in ("no_announcement", "deferred_or_lagging"):
         # No announcement that day (BJT Saturday/Sunday, or a US-holiday /
@@ -287,6 +290,7 @@ def main():
         ranked = candidates
     else:
         print(f"\n[4/5] Ranking {len(candidates)} papers with LLM...")
+        emit("rank", 0, 0, "Starting…")
         llm_config = config.get("llm", {})
         ranked = rank_papers(candidates, profile, llm_config)
     
@@ -309,6 +313,7 @@ def main():
     
     # Step 5: Generate outputs
     print("\n[5/5] Generating outputs...")
+    emit("output", 0, 0, "Generating BibTeX and digest…")
     
     # BibTeX output (date-stamped) - only ranked papers above threshold
     bibtex_dir = output_cfg.get("bibtex_dir", "./output/bibtex")
@@ -332,6 +337,7 @@ def main():
             send_digest_email(digest_content, email_config)
     
     print("\n=== Done! ===")
+    emit("done", 1, 1, "All done")
     print(f"  BibTeX: {bibtex_path}")
     print(f"  Digest: {digest_path}")
     print(f"  Papers scored: {len(ranked)}")

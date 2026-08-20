@@ -275,8 +275,8 @@ def _live_send(recipient_override=None):
         email_config["recipient"] = recipient_override
 
     body = (
-        "这是一封 AstroPaperDigest 邮件提醒功能的测试邮件。\n"
-        "如果你收到了它，说明 SMTP 配置和邮件发送功能工作正常。\n\n"
+        "This is a test email from the AstroPaperDigest notification feature.\n"
+        "If you received it, your SMTP configuration and email sending work correctly.\n\n"
         "This is a test email for the AstroPaperDigest email reminder.\n"
         "If you received it, the SMTP configuration and email sending work."
     )

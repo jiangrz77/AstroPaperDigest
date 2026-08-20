@@ -8,6 +8,17 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Version comes from version.txt (single source of truth)
+VERSION="$(cat version.txt 2>/dev/null | tr -d '[:space:]')"
+if [ -z "$VERSION" ]; then
+    echo "ERROR: version.txt missing or empty." >&2
+    exit 1
+fi
+case "$VERSION" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) echo "ERROR: invalid version '$VERSION' in version.txt (expected x.y.z)." >&2; exit 1 ;;
+esac
+
 APP_NAME="AstroPaperDigest"
 APP_DIR="../$APP_NAME.app"
 
@@ -21,7 +32,7 @@ mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 
 # 1. Info.plist
-cat > "$APP_DIR/Contents/Info.plist" << 'EOF'
+cat > "$APP_DIR/Contents/Info.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -35,9 +46,9 @@ cat > "$APP_DIR/Contents/Info.plist" << 'EOF'
     <key>CFBundleDisplayName</key>
     <string>AstroPaperDigest</string>
     <key>CFBundleVersion</key>
-    <string>1.0.2</string>
+    <string>${VERSION}</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.2</string>
+    <string>${VERSION}</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleIconFile</key>

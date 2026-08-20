@@ -104,7 +104,7 @@ def main() -> int:
 
     print()
     print("All login attempts failed. Likely causes:")
-    print("  1. Wrong password - CSTNet/CAS mail may need a '客户端专用密码' (client")
+    print("  1. Wrong password - CSTNet/CAS mail may need a 'client-specific password' (client")
     print("     authorization code), not the web-login password.")
     print("  2. The account has two-factor authentication enabled and needs an app")
     print("     password for SMTP.")

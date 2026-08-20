@@ -21,6 +21,28 @@
 
 > **macOS 安全提示？** 前往 **系统设置 → 隐私与安全性**，点击 **"仍要打开"**。仅需操作一次。
 
+## 更新机制
+
+- **检查时机**：应用启动时自动在后台检查一次（网络失败静默），也可在 **设置页（⛭）→ General → Update** 手动点击「Check for Updates」。
+- **推送提示**：发现新版本时，Digest 页顶部显示蓝色横幅；设置页的 Update 分组显示当前/最新版本与更新日志。
+- **安装流程**（半自动）：在设置页点击「Download Update」→ 下载完成后自动做 SHA-256 校验 → 点击「Install & Restart」→ 自动备份旧代码、替换源码、重建 .app 并重新打开。
+- **更新源**：GitHub Releases（公开仓库）。检查接口：`https://api.github.com/repos/jiangrz77/AstroPaperDigest/releases/latest`。
+- **版本号**：单一版本源 `version.txt`（构建 .app 时由 `build_app.sh` 读取）。
+- **保留文件**：更新不会覆盖 `.env`、`config.yaml`、`preferences.json`、`feedback.json`、`data/`、`output/`、`.venv`；旧代码自动备份到 `backups/`。
+
+## 发布新版本（开发者）
+
+1. 修改 `version.txt`（如 `1.0.3`），提交并推送：
+   ```bash
+   git add . && git commit -m "v1.0.3" && git push origin main
+   git tag v1.0.3 && git push origin v1.0.3
+   ```
+2. 运行 `./release.sh` —— 自动生成 `AstroPaperDigest-v1.0.3.zip` 与 `version.json`（含 SHA-256）。
+3. GitHub 网页：仓库 → **Releases → Draft a new release** → 选择标签 `v1.0.3` → 写更新日志 → 上传 zip 附件 → **Publish release**（不要勾选 Pre-release）。
+4. 用户端启动 App 或点「检查更新」即可收到新版本提示并一键更新。
+
+> 若仓库为私有：GitHub Releases 无法匿名访问。可将 `release.sh` 生成的 `version.json` + zip 上传到任意静态托管，并把 `config.yaml` 中 `update.github_repo` 改为对应地址（或直接使用自建静态 JSON 更新源）。
+
 ## 环境要求
 
 - macOS（Apple Silicon 或 Intel）

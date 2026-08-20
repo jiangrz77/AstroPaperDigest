@@ -46,6 +46,8 @@ import arxiv
 import requests
 import urllib.request
 
+from .progress import emit
+
 
 _MIN_REQUEST_INTERVAL = 3.1
 _PAGE_SIZE = 300
@@ -55,7 +57,7 @@ _PROJECT_DIR = Path(__file__).resolve().parent.parent
 _RATE_LIMIT_FILE = _PROJECT_DIR / "output" / ".arxiv_api_rate_limit"
 _API_THREAD_LOCK = Lock()
 _RECENT_LIST_URL = "https://arxiv.org/list/astro-ph/recent?skip=0&show=2000"
-_ARXIV_USER_AGENT = "AstroPaperDigest/1.0.2"
+_ARXIV_USER_AGENT = "AstroPaperDigest/1.0.3"
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _MONTHS = (
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -305,6 +307,9 @@ def _fetch_listed_papers(
 
     client = _new_client(trust_env=trust_env)
     papers_by_id = {}
+    total_ids = len(ids)
+    fetched = 0
+    emit("fetch", 0, total_ids, f"Fetching arXiv papers… ({total_ids} total)")
 
     for start in range(0, len(ids), _ID_LIST_BATCH_SIZE):
         batch = ids[start:start + _ID_LIST_BATCH_SIZE]
@@ -323,6 +328,10 @@ def _fetch_listed_papers(
                             continue
                         if item["base_id"] not in papers_by_id:
                             papers_by_id[item["base_id"]] = item["paper"]
+                            fetched += 1
+                            if fetched % 5 == 0 or fetched == total_ids:
+                                emit("fetch", fetched, total_ids,
+                                     f"Fetched {fetched}/{total_ids} arXiv papers…")
                 break
             except requests.exceptions.ProxyError:
                 if trust_env and attempt == 0:
@@ -478,6 +487,7 @@ def _fetch_api_window(
     client = _new_client()
     proxy_retried = False
     effective_max = max_results
+    fetched = 0
 
     submitted_search = arxiv.Search(
         query=cat_query,
@@ -501,6 +511,7 @@ def _fetch_api_window(
     attempt = 0
     while attempt < max_retries:
         papers_by_id = {}
+        fetched = 0
         try:
             if attempt > 0:
                 wait = 30
@@ -534,6 +545,11 @@ def _fetch_api_window(
                         if item["base_id"] in papers_by_id:
                             continue
                         papers_by_id[item["base_id"]] = item["paper"]
+                        fetched += 1
+                        if fetched % 10 == 0:
+                            emit("fetch", fetched, 0,
+                                 f"Fetched {fetched} arXiv papers…")
+            emit("fetch", fetched, 0, f"Fetched {fetched} arXiv papers")
             break  # Success
         except requests.exceptions.ProxyError:
             if not proxy_retried:
@@ -701,6 +717,7 @@ def fetch_papers(
     attempt = 0
     while attempt < max_retries:
         papers_by_id = {}
+        fetched = 0
         try:
             if attempt > 0:
                 wait = 30
@@ -729,6 +746,11 @@ def fetch_papers(
                         if item["base_id"] in papers_by_id:
                             continue
                         papers_by_id[item["base_id"]] = item["paper"]
+                        fetched += 1
+                        if fetched % 10 == 0:
+                            emit("fetch", fetched, 0,
+                                 f"Fetched {fetched} arXiv papers…")
+            emit("fetch", fetched, 0, f"Fetched {fetched} arXiv papers")
             break  # Success
         except requests.exceptions.ProxyError:
             if not proxy_retried:

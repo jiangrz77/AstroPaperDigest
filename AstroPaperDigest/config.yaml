@@ -63,7 +63,7 @@ bib_file: data/references-example.bib
 llm:
   base_url: https://api.deepseek.com
   api_key_env: DEEPSEEK_API_KEY
-  model: deepseek-chat
+  model: deepseek-v4-flash
 output:
   bibtex_dir: ./output/bibtex
   digest_dir: ./output/digests
@@ -76,7 +76,7 @@ email:
   recipient: rzjiang@pmo.ac.cn
   password_env: EMAIL_APP_PASSWORD
 filter:
-  max_candidates_for_llm: 80
+  max_candidates_for_llm: 100
   score_threshold: 7
 timezone:
   digest: Asia/Shanghai
@@ -92,3 +92,9 @@ arxiv_schedule:
   - '2026-12-25'
   - '2026-12-29'
   - '2026-12-31'
+update:
+  # Update source: public GitHub repository (the client checks anonymously via the GitHub Releases API).
+  # If the repository is private, you can self-host a static JSON update source instead
+  # (upload the version.json produced by release.sh to any static host, and change the
+  # github_repo setting below).
+  github_repo: jiangrz77/AstroPaperDigest

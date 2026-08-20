@@ -7,6 +7,7 @@ pipeline runs in background -> page auto-updates when done.
 
 import argparse
 import json
+import math
 import os
 import re
 import signal
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import time
 import webbrowser
+from collections import deque
 from datetime import date, datetime
 from pathlib import Path
 from queue import Empty, Queue
@@ -28,6 +30,13 @@ os.chdir(_PROJECT_DIR)
 sys.path.insert(0, str(_PROJECT_DIR))
 
 from src.digest_parser import parse_digest, get_latest_digest_path, get_digest_path_for_date, get_available_dates
+from src import updater
+from src.preference_learning import (
+    load_learned_profile,
+    rebuild_learned_profile,
+    reset_learned_profile,
+)
+from src.progress import parse as parse_progress
 
 FEEDBACK_FILE = os.path.join(_PROJECT_DIR, "feedback.json")
 PREFERENCES_FILE = os.path.join(_PROJECT_DIR, "preferences.json")
@@ -39,6 +48,9 @@ _current_digest = None
 _pipeline_status = "idle"  # idle | running | done | error
 _pipeline_message = ""
 _pipeline_process = None
+_pipeline_started_at = None
+_pipeline_progress = {"stage": "", "done": 0, "total": 0, "message": ""}
+_pipeline_log = deque(maxlen=60)
 _pipeline_lock = Lock()
 _browser_clients = {}
 _browser_clients_lock = Lock()
@@ -80,6 +92,277 @@ _BROWSER_LIFECYCLE_SCRIPT = """
 })();
 </script>
 """
+
+# --- Update check state ---
+_update_state = {
+    "status": "idle",  # idle|checking|available|up_to_date|downloading|ready|installing|error
+    "current": updater.get_current_version(),
+    "latest": "",
+    "tag": "",
+    "notes": "",
+    "published_at": "",
+    "download_url": "",
+    "sha256": "",
+    "progress": 0,
+    "error": "",
+    "checked_at": "",
+}
+_update_lock = Lock()
+
+_UPDATE_BANNER_SCRIPT = """
+<div id="apd-update-banner" style="display:none;background:#2563eb;color:#fff;padding:10px 20px;font-size:13px;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap">
+  <span id="apd-update-text"></span>
+  <a id="apd-update-view" href="/settings#update" style="color:#fff;font-weight:600;text-decoration:underline">View</a>
+  <button id="apd-update-now" style="background:#fff;color:#2563eb;border:none;border-radius:6px;padding:5px 14px;font-weight:600;cursor:pointer">Update Now</button>
+  <button id="apd-update-later" style="background:transparent;color:#fff;border:1px solid rgba(255,255,255,.5);border-radius:6px;padding:5px 14px;cursor:pointer">Remind Me Later</button>
+</div>
+<script>
+(function () {
+  var STORAGE_KEY = "apdUpdateDismissed";
+  function showBanner(s) {
+    var bar = document.getElementById("apd-update-banner");
+    if (!bar) return;
+    document.getElementById("apd-update-text").textContent =
+      "New version v" + s.latest + " available (current v" + s.current + ")";
+    bar.style.display = "flex";
+    document.getElementById("apd-update-now").addEventListener("click", function () {
+      fetch("/update/download", {method: "POST", cache: "no-store"}).then(function (r) { return r.json(); }).then(function (d) {
+        if (d.ok) {
+          window.location.href = "/settings#update";
+        } else if (d.error) {
+          alert(d.error);
+        }
+      }).catch(function () {});
+    });
+    document.getElementById("apd-update-later").addEventListener("click", function () {
+      try { sessionStorage.setItem(STORAGE_KEY, s.latest); } catch (_) {}
+      bar.style.display = "none";
+    });
+  }
+  fetch("/update/status").then(function (r) { return r.json(); }).then(function (s) {
+    if (!s || s.status !== "available") return;
+    try {
+      if (sessionStorage.getItem(STORAGE_KEY) === s.latest) return;
+    } catch (_) {}
+    showBanner(s);
+  }).catch(function () {});
+})();
+</script>
+"""
+
+
+def _load_config_and_env():
+    """Return (config dict, .env dict) from config.yaml and .env."""
+    import yaml
+    cfg = {}
+    config_path = os.path.join(_PROJECT_DIR, "config.yaml")
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    env_vars = {}
+    env_path = os.path.join(_PROJECT_DIR, ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env_vars[k.strip()] = v.strip().strip('"').strip("'")
+    return cfg, env_vars
+
+
+def _write_env(env_values: dict) -> None:
+    """Write .env, escaping values and locking down permissions."""
+    env_path = os.path.join(_PROJECT_DIR, ".env")
+    with open(env_path, "w", encoding="utf-8") as f:
+        for key, value in env_values.items():
+            escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+            f.write(f'{key}="{escaped}"\n')
+    os.chmod(env_path, 0o600)
+
+
+def _write_config(config: dict) -> None:
+    """Write config.yaml, preserving key order and unicode."""
+    import yaml
+    config_path = os.path.join(_PROJECT_DIR, "config.yaml")
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+
+def _apply_llm(config: dict, env_values: dict, provider: str, api_key: str,
+               model: str, base_url: str) -> str:
+    """Update LLM config + .env values; returns the API key env var name."""
+    if provider == "deepseek":
+        api_key_env = "DEEPSEEK_API_KEY"
+        base_url = "https://api.deepseek.com"
+    elif provider == "openai":
+        api_key_env = "OPENAI_API_KEY"
+        base_url = "https://api.openai.com/v1"
+    else:
+        api_key_env = "CUSTOM_API_KEY"
+
+    if provider == "custom" and not base_url:
+        abort(400, "Base URL is required for a custom provider.")
+    if not model:
+        abort(400, "Model name is required.")
+
+    env_values[api_key_env] = api_key
+    llm_cfg = config.setdefault("llm", {})
+    llm_cfg["base_url"] = base_url
+    llm_cfg["api_key_env"] = api_key_env
+    llm_cfg["model"] = model
+    return api_key_env
+
+
+def _apply_interests(config: dict, request) -> None:
+    """Update research-interest settings (quick keywords or bib profile)."""
+    profile_mode = request.form.get("profile_mode", "quick")
+    if profile_mode == "quick":
+        categories = request.form.getlist("categories")
+        keywords_raw = request.form.get("keywords", "").strip()
+        if categories:
+            config["arxiv_categories"] = categories
+        if keywords_raw:
+            config["keywords"] = [k.strip() for k in keywords_raw.split(",") if k.strip()]
+    else:
+        bib_file = request.files.get("bib_file")
+        bib_path = request.form.get("bib_path", "").strip()
+        if bib_file and bib_file.filename:
+            data_dir = os.path.join(_PROJECT_DIR, "data")
+            os.makedirs(data_dir, exist_ok=True)
+            filename = secure_filename(bib_file.filename)
+            if not filename:
+                abort(400, "Invalid BibTeX filename.")
+            bib_file.save(os.path.join(data_dir, filename))
+            config["bib_file"] = f"data/{filename}"
+        elif bib_path:
+            config["bib_file"] = bib_path
+
+
+def _apply_email(config: dict, env_values: dict, enable_email: bool,
+                 email_sender: str, email_recipient: str, smtp_server: str,
+                 smtp_protocol: str, smtp_port_value: str,
+                 email_password: str) -> None:
+    """Update email config + credentials; never wipe stored values when off."""
+    smtp_port = 465 if smtp_protocol == "ssl" else 587
+    if enable_email:
+        try:
+            smtp_port = int(smtp_port_value) if smtp_port_value else smtp_port
+        except ValueError:
+            abort(400, "SMTP port must be an integer.")
+        if not 1 <= smtp_port <= 65535:
+            abort(400, "SMTP port must be between 1 and 65535.")
+
+    if enable_email:
+        env_values["EMAIL_APP_PASSWORD"] = email_password
+        env_values["EMAIL_SENDER"] = email_sender
+        env_values["EMAIL_RECIPIENT"] = email_recipient or email_sender
+        env_values["SMTP_SERVER"] = smtp_server
+        env_values["SMTP_PORT"] = str(smtp_port)
+
+    email_cfg = config.setdefault("email", {})
+    if enable_email and email_sender and smtp_server:
+        email_cfg["enabled"] = True
+        email_cfg["sender"] = email_sender
+        email_cfg["recipient"] = email_recipient or email_sender
+        email_cfg["smtp_server"] = smtp_server
+        email_cfg["use_ssl"] = (smtp_protocol == "ssl")
+        email_cfg["smtp_port"] = smtp_port
+        email_cfg["password_env"] = "EMAIL_APP_PASSWORD"
+    else:
+        email_cfg["enabled"] = False
+
+
+def _setup_context() -> dict:
+    """Build the shared template context for /setup and /settings."""
+    cfg, env_vars = _load_config_and_env()
+    email_cfg = cfg.get("email", {})
+    llm_cfg = cfg.get("llm", {})
+    api_key_env = llm_cfg.get("api_key_env", "DEEPSEEK_API_KEY")
+    provider = {"DEEPSEEK_API_KEY": "deepseek", "OPENAI_API_KEY": "openai"}.get(api_key_env, "custom")
+    return {
+        "cur_provider": provider,
+        "cur_model": llm_cfg.get("model", "deepseek-v4-flash"),
+        "cur_base_url": llm_cfg.get("base_url", ""),
+        "cur_api_key": env_vars.get(
+            "DEEPSEEK_API_KEY",
+            env_vars.get("OPENAI_API_KEY", env_vars.get("CUSTOM_API_KEY", "")),
+        ),
+        "cur_categories": cfg.get("arxiv_categories", []),
+        "cur_keywords": ", ".join(cfg.get("keywords", [])),
+        "cur_bib_file": cfg.get("bib_file", ""),
+        "cur_email_sender": email_cfg.get("sender", ""),
+        "cur_email_recipient": email_cfg.get("recipient", ""),
+        "cur_smtp_server": email_cfg.get("smtp_server", ""),
+        "cur_smtp_port": str(email_cfg.get("smtp_port", "465")),
+        "cur_use_ssl": email_cfg.get("use_ssl", True),
+        "cur_email_enabled": email_cfg.get("enabled", False),
+        "cur_email_password": env_vars.get("EMAIL_APP_PASSWORD", ""),
+    }
+
+
+def _update_config() -> dict:
+    """Return the 'update' section of config.yaml (defaults GitHub repo)."""
+    try:
+        import yaml
+        with open(os.path.join(_PROJECT_DIR, "config.yaml"), "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return cfg.get("update", {}) or {}
+    except Exception:
+        return {}
+
+
+def _start_update_check():
+    """Check GitHub Releases for a newer version and update _update_state."""
+    repo = _update_config().get("github_repo", "jiangrz77/AstroPaperDigest")
+    with _update_lock:
+        _update_state["status"] = "checking"
+        _update_state["error"] = ""
+    try:
+        result = updater.check_update(repo)
+        with _update_lock:
+            _update_state.update({
+                "status": "available" if result["available"] else "up_to_date",
+                "latest": result["latest"],
+                "tag": result["tag"],
+                "notes": result["notes"],
+                "published_at": result["published_at"],
+                "download_url": result["download_url"],
+                "sha256": result["sha256"],
+                "checked_at": datetime.now().isoformat(timespec="seconds"),
+                "error": "",
+            })
+    except updater.UpdateCheckError as e:
+        with _update_lock:
+            _update_state.update({"status": "error", "error": str(e)})
+    except Exception as e:
+        with _update_lock:
+            _update_state.update({"status": "error", "error": f"Update check failed: {e}"})
+
+
+def _download_update(url: str, version: str, expected_sha: str):
+    """Download the release zip in the background with progress."""
+    dest = updater.UPDATES_DIR / f"AstroPaperDigest-v{version}.zip"
+
+    def progress(done, total):
+        pct = int(done * 100 / total) if total else 0
+        with _update_lock:
+            _update_state["progress"] = pct
+
+    try:
+        path = updater.download_file(url, dest, progress)
+        if not updater.verify_sha256(path, expected_sha):
+            with _update_lock:
+                _update_state.update({
+                    "status": "error",
+                    "error": "Package verification failed (SHA-256 mismatch). Installation stopped.",
+                })
+            return
+        with _update_lock:
+            _update_state.update({"status": "ready", "progress": 100})
+    except Exception as e:
+        with _update_lock:
+            _update_state.update({"status": "error", "error": f"Download failed: {e}"})
 
 
 def _terminate_server():
@@ -147,13 +430,8 @@ def add_browser_lifecycle(response):
     if response.mimetype == "text/html":
         content = response.get_data(as_text=True)
         if "</body>" in content:
-            response.set_data(
-                content.replace(
-                    "</body>",
-                    f"{_BROWSER_LIFECYCLE_SCRIPT}</body>",
-                    1,
-                )
-            )
+            inject = f"{_UPDATE_BANNER_SCRIPT}\n{_BROWSER_LIFECYCLE_SCRIPT}\n</body>"
+            response.set_data(content.replace("</body>", inject, 1))
     return response
 
 
@@ -190,6 +468,8 @@ def load_preferences() -> dict:
         "include_cross": True,
         "include_replacements": True,
         "last_viewed_date": "",
+        "auto_check_updates": True,
+        "dismissed_update_version": "",
     }
     if os.path.exists(PREFERENCES_FILE):
         try:
@@ -222,6 +502,17 @@ def save_feedback(feedback: list):
         json.dump(feedback, f, indent=2, ensure_ascii=False)
 
 
+_STAGE_LABELS = {
+    "profile": "Profile",
+    "fetch": "Fetching arXiv papers",
+    "filter": "Filtering papers",
+    "rank": "AI ranking",
+    "output": "Generating output",
+    "done": "Done",
+    "error": "Error",
+}
+
+
 def _pipeline_progress_message(line: str) -> str:
     """Convert CLI output into a concise browser status message."""
     line = line.strip()
@@ -229,12 +520,18 @@ def _pipeline_progress_message(line: str) -> str:
         return ""
     if line.startswith("["):
         return line
-    if line.startswith("Ranking batch"):
-        return f"AI ranking: {line.lower()}"
     if line.startswith(("Fetched ", "Category filter:", "Keyword filter:")):
         return line
     if line.startswith("Sending email"):
         return "Sending email notification..."
+    if line.startswith("Respecting arXiv"):
+        return "Waiting for arXiv rate-limit interval…"
+    if line.startswith("Proxy connection failed"):
+        return "Proxy connection failed; retrying without proxy…"
+    if line.startswith("Waiting "):
+        return f"{line.lower()}…"
+    if line.startswith(("Submission window", "arXiv API", "Error fetching")):
+        return line
     if "before retry" in line or "rate limit" in line.lower():
         return line
     return ""
@@ -288,9 +585,21 @@ def _stream_pipeline(cmd: list[str], timeout: int = 900) -> tuple[int, str]:
                 break
 
             output_lines.append(output_line)
-            progress = _pipeline_progress_message(output_line)
-            if progress:
-                _pipeline_message = progress
+            event = parse_progress(output_line)
+            if event:
+                _pipeline_progress.update({
+                    "stage": event.get("stage") or _pipeline_progress.get("stage", ""),
+                    "done": event.get("done", 0) or 0,
+                    "total": event.get("total", 0) or 0,
+                    "message": event.get("message") or "",
+                })
+                if event.get("message"):
+                    _pipeline_message = event["message"]
+            else:
+                _pipeline_log.append(output_line.rstrip("\n"))
+                progress = _pipeline_progress_message(output_line)
+                if progress:
+                    _pipeline_message = progress
 
         return _pipeline_process.wait(), "".join(output_lines)
     finally:
@@ -300,7 +609,16 @@ def _stream_pipeline(cmd: list[str], timeout: int = 900) -> tuple[int, str]:
 def run_pipeline(include_cross: bool = True, include_replacements: bool = True, target_date: str = ""):
     """Run the recommendation pipeline in a background thread."""
     global _current_digest, _pipeline_status, _pipeline_message
+    global _pipeline_started_at, _pipeline_progress
     _pipeline_status = "running"
+    _pipeline_started_at = time.time()
+    _pipeline_log.clear()
+    _pipeline_progress = {
+        "stage": "profile",
+        "done": 0,
+        "total": 0,
+        "message": "[1/5] Starting pipeline…",
+    }
     _pipeline_message = "[1/5] Starting pipeline..."
 
     try:
@@ -333,13 +651,14 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
             except Exception:
                 _current_digest = None
             _pipeline_status = "done"
+            _pipeline_progress.update({"stage": "done", "done": 1, "total": 1})
             # Set contextual message based on result
             if "NOT_YET_AVAILABLE" in stdout:
-                _pipeline_message = "今日批次尚未公布（预计约 10:00 后可见），未生成 digest。"
+                _pipeline_message = "Today's batch is not published yet (expected after ~10:00); no digest generated."
             elif "NO_ANNOUNCEMENT" in stdout:
-                _pipeline_message = "arXiv 当日无公布批次（周末/节假日顺延），已生成空 digest。"
+                _pipeline_message = "No arXiv announcement on this day (weekend/holiday deferral); an empty digest was generated."
             elif "DEFERRED_OR_LAGGING" in stdout:
-                _pipeline_message = "该日批次疑似被顺延（节假日）或页面滞后，已生成空 digest。"
+                _pipeline_message = "This day's batch may be deferred (holiday) or the listing lags; an empty digest was generated."
             elif (
                 "No papers found" in stdout
                 or "No new papers since last digest" in stdout
@@ -361,6 +680,7 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
                 _pipeline_message = "Complete!"
         else:
             _pipeline_status = "error"
+            _pipeline_progress.update({"stage": "error"})
             # Show a cleaner error message
             if "HTTPError" in stdout and "429" in stdout:
                 _pipeline_message = (
@@ -383,9 +703,11 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
                     _pipeline_message = (stdout or "Unknown error")[-800:]
     except subprocess.TimeoutExpired:
         _pipeline_status = "error"
+        _pipeline_progress.update({"stage": "error"})
         _pipeline_message = "Pipeline timed out (>15 minutes)."
     except Exception as e:
         _pipeline_status = "error"
+        _pipeline_progress.update({"stage": "error"})
         _pipeline_message = str(e)
 
 
@@ -465,7 +787,7 @@ textarea{height:80px;resize:vertical}
     <label for="api_key">API Key</label>
     <input type="password" id="api_key" name="api_key" placeholder="sk-..." value="{{ cur_api_key or '' }}" required>
     <label for="model">Model</label>
-    <input type="text" id="model" name="model" value="{{ cur_model or 'deepseek-chat' }}">
+    <input type="text" id="model" name="model" value="{{ cur_model or 'deepseek-v4-flash' }}">
     <div id="baseurl-group" style="display:none">
       <label for="base_url">Base URL</label>
       <input type="text" id="base_url" name="base_url" placeholder="https://api.example.com/v1" value="{{ cur_base_url or '' }}">
@@ -503,11 +825,11 @@ textarea{height:80px;resize:vertical}
 
   <div class="step">
     <h2><span class="step-num">3</span>Email Notification (Optional)</h2>
-    <label style="display:flex;align-items:center;gap:8px;font-weight:600;cursor:pointer">
-      <input type="checkbox" id="enable_email" name="enable_email" onchange="toggleEmail()" {% if cur_email_enabled %}checked{% endif %}>
+    <label style="display:flex;align-items:center;gap:8px;font-weight:600;color:#999;cursor:not-allowed">
+      <input type="checkbox" id="enable_email" name="enable_email" onchange="toggleEmail()" {% if cur_email_enabled %}checked{% endif %} disabled>
       Enable email notification
     </label>
-    <p class="hint">Optional. Turn this on to receive the daily digest by email.</p>
+    <p class="hint">Daily email reminders are still under development. Stay tuned.</p>
     <div id="email-fields" {% if not cur_email_enabled %}style="display:none"{% endif %}>
       <label for="email_sender">Sender Email</label>
       <input type="text" id="email_sender" name="email_sender" placeholder="you@example.com" value="{{ cur_email_sender or '' }}">
@@ -540,7 +862,7 @@ function updateProvider() {
   const model = document.getElementById('model');
   const urlGroup = document.getElementById('baseurl-group');
   const baseUrl = document.getElementById('base_url');
-  if (p === 'deepseek') { model.value = 'deepseek-chat'; urlGroup.style.display = 'none'; }
+  if (p === 'deepseek') { model.value = 'deepseek-v4-flash'; urlGroup.style.display = 'none'; }
   else if (p === 'openai') { model.value = 'gpt-4o-mini'; urlGroup.style.display = 'none'; }
   else { model.value = ''; urlGroup.style.display = 'block'; baseUrl.focus(); }
 }
@@ -557,6 +879,488 @@ function toggleEmail() {
   const on = document.getElementById('enable_email').checked;
   document.getElementById('email-fields').style.display = on ? '' : 'none';
 }
+</script>
+</body>
+</html>"""
+
+SETTINGS_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AstroPaperDigest - Settings</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333}
+.header{background:#1a2332;color:#fff;padding:16px 32px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.header h1{font-size:20px;margin:0}
+.header .back-link{display:inline-flex;align-items:center;gap:8px;background:#fff;color:#1a2332;text-decoration:none;font-size:14px;font-weight:700;padding:9px 16px;border-radius:999px;box-shadow:0 2px 10px rgba(0,0,0,.25);transition:transform .15s,box-shadow .15s}
+.header .back-link:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.35);color:#1a2332}
+.layout{display:flex;align-items:flex-start;max-width:1100px;margin:0 auto;padding:24px 16px;gap:24px}
+.sidebar{width:220px;flex-shrink:0;background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.08);padding:8px;position:sticky;top:24px}
+.nav-item{display:flex;align-items:center;gap:10px;width:100%;padding:10px 14px;border:none;border-radius:8px;background:transparent;font-size:14px;color:#444;cursor:pointer;text-align:left}
+.nav-item:hover{background:#f0f2f5}
+.nav-item.active{background:#2563eb;color:#fff;font-weight:600}
+.nav-icon{font-size:16px;width:22px;text-align:center}
+.content{flex:1;min-width:0}
+.panel{display:none}
+.panel.active{display:block}
+.card{background:#fff;border-radius:10px;padding:24px;margin-bottom:20px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.card h2{font-size:16px;margin-bottom:4px;color:#2c3e50}
+.card .sub{font-size:13px;color:#888;margin-bottom:16px}
+label{display:block;font-size:13px;font-weight:600;color:#555;margin-bottom:6px;margin-top:14px}
+input[type="text"],input[type="password"],select,textarea{width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:6px;font-size:14px;margin-bottom:4px}
+input:focus,select:focus,textarea:focus{outline:none;border-color:#2563eb;box-shadow:0 0 0 2px rgba(37,99,235,.15)}
+textarea{height:90px;resize:vertical}
+.checkbox-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}
+.checkbox-grid label{display:flex;align-items:center;gap:6px;font-weight:400;font-size:13px;margin:0}
+.checkbox-grid input{width:auto}
+.toggle-group{display:flex;gap:12px;margin-bottom:12px}
+.toggle-group label{display:flex;align-items:center;gap:6px;font-weight:500;margin:0;cursor:pointer}
+.toggle-group input{width:auto}
+.hint{font-size:12px;color:#999;margin-top:4px}
+.btn{padding:9px 18px;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer}
+.btn-primary{background:#2563eb;color:#fff}
+.btn-primary:hover{background:#1d4ed8}
+.btn-success{background:#16a34a;color:#fff}
+.btn-success:hover{background:#15803d}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+.check-line{display:flex;align-items:center;gap:8px;margin:10px 0;cursor:pointer}
+.check-line input{width:auto}
+.version-badge{display:inline-block;background:#eef2ff;color:#2563eb;border:1px solid #c7d2fe;border-radius:12px;padding:2px 10px;font-size:12px;font-weight:600}
+.update-status{font-size:13px;color:#666;margin-top:10px;min-height:18px}
+.update-notes{display:none;margin-top:10px;padding:10px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;font-size:13px;color:#444;white-space:pre-wrap;max-height:160px;overflow-y:auto}
+.update-progress{display:none;margin-top:10px;height:8px;background:#e2e8f0;border-radius:4px;overflow:hidden}
+.update-progress-bar{height:100%;width:0;background:#2563eb;transition:width .3s}
+.notice{background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;border-radius:8px;padding:12px 14px;font-size:13px}
+.lp-table{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}
+.lp-table th,.lp-table td{padding:8px 6px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:middle}
+.lp-table input{width:82px;padding:6px 8px;margin:0;font-size:13px}
+.lp-badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:6px;font-weight:600}
+.lp-auto{background:#eef2ff;color:#2563eb}
+.lp-manual{background:#fef3c7;color:#b45309}
+.lp-ignored{background:#f1f5f9;color:#64748b}
+.lp-source{color:#999;font-size:11px;display:block;margin-top:2px}
+.lp-empty{color:#999;font-size:13px;margin:8px 0}
+.lp-cal{font-size:13px;margin:4px 0 10px}
+.lp-btn{padding:5px 10px;border:1px solid #ddd;border-radius:6px;font-size:12px;cursor:pointer;background:#fff;margin-right:4px}
+.lp-btn:hover{border-color:#999}
+.lp-btn.danger{color:#dc2626;border-color:#fecaca}
+.lp-btn.danger:hover{background:#fef2f2}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>AstroPaperDigest - Settings</h1>
+  <a class="back-link" href="/">← Back to Digest</a>
+</div>
+<div class="layout">
+  <nav class="sidebar">
+    <button class="nav-item active" data-section="general" onclick="activate('general')"><span class="nav-icon">⚙️</span>General</button>
+    <button class="nav-item" data-section="llm" onclick="activate('llm')"><span class="nav-icon">🤖</span>LLM &amp; API</button>
+    <button class="nav-item" data-section="interests" onclick="activate('interests')"><span class="nav-icon">📚</span>Research Interests</button>
+    <button class="nav-item" data-section="learned" onclick="activate('learned')"><span class="nav-icon">🎯</span>Learned Preferences</button>
+    <button class="nav-item" data-section="email" onclick="activate('email')"><span class="nav-icon">✉️</span>Email Notification</button>
+  </nav>
+  <main class="content">
+
+    <section class="panel active" id="panel-general">
+      <div class="card">
+        <h2>General</h2>
+        <p class="sub">Digest preferences and application updates.</p>
+        <label class="check-line" style="margin-top:0">
+          <input type="checkbox" id="pref-cross" {% if prefs.include_cross %}checked{% endif %}>
+          Include cross-listed papers
+        </label>
+        <label class="check-line">
+          <input type="checkbox" id="pref-repl" {% if prefs.include_replacements %}checked{% endif %}>
+          Include replacement (updated) papers
+        </label>
+        <div class="row">
+          <button class="btn btn-primary" type="button" id="btn-save-general" onclick="saveGeneral()">Save Changes</button>
+        </div>
+      </div>
+
+      <div class="card" id="update">
+        <h2>Update</h2>
+        <p class="sub">Current version: <span class="version-badge">v{{ current_version }}</span></p>
+        <p class="update-status" id="update-status">—</p>
+        <div class="update-notes" id="update-notes"></div>
+        <div class="update-progress" id="update-progress"><div class="update-progress-bar" id="update-progress-bar"></div></div>
+        <div class="row">
+          <button class="btn btn-primary" type="button" id="btn-check-update">Check for Updates</button>
+          <button class="btn btn-primary" type="button" id="btn-download-update" style="display:none">Download Update</button>
+          <button class="btn btn-success" type="button" id="btn-apply-update" style="display:none">Install &amp; Restart</button>
+        </div>
+        <label class="check-line" style="margin-top:16px">
+          <input type="checkbox" id="auto-check-updates" {% if prefs.auto_check_updates %}checked{% endif %}>
+          Check for updates on startup
+        </label>
+      </div>
+
+      <div class="card">
+        <h2>About</h2>
+        <p class="sub">AstroPaperDigest v{{ current_version }} — LLM-scored daily arXiv digests for your research interests.</p>
+        <a href="https://github.com/jiangrz77/AstroPaperDigest" target="_blank" style="font-size:13px;color:#2563eb">GitHub Repository ↗</a>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-llm">
+      <div class="card">
+        <h2>LLM &amp; API</h2>
+        <p class="sub">Configure the LLM provider used to score paper relevance.</p>
+        <form method="POST" action="/settings/save?section=llm">
+          <label for="provider">Provider</label>
+          <select id="provider" name="provider" onchange="updateProvider()">
+            <option value="deepseek" {% if cur_provider == 'deepseek' %}selected{% endif %}>DeepSeek</option>
+            <option value="openai" {% if cur_provider == 'openai' %}selected{% endif %}>OpenAI</option>
+            <option value="custom" {% if cur_provider == 'custom' %}selected{% endif %}>Custom (OpenAI-compatible)</option>
+          </select>
+          <label for="api_key">API Key</label>
+          <input type="password" id="api_key" name="api_key" placeholder="sk-..." value="{{ cur_api_key or '' }}">
+          <label for="model">Model</label>
+          <input type="text" id="model" name="model" value="{{ cur_model or 'deepseek-v4-flash' }}">
+          <div id="baseurl-group" style="display:none">
+            <label for="base_url">Base URL</label>
+            <input type="text" id="base_url" name="base_url" placeholder="https://api.example.com/v1" value="{{ cur_base_url or '' }}">
+          </div>
+          <div class="row">
+            <button class="btn btn-primary" type="submit">Save Changes</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-interests">
+      <div class="card">
+        <h2>Research Interests</h2>
+        <p class="sub">Control which arXiv papers are fetched and how your profile is built.</p>
+        <form method="POST" action="/settings/save?section=interests" enctype="multipart/form-data">
+          <div class="toggle-group">
+            <label><input type="radio" name="profile_mode" value="quick" {% if not cur_bib_file %}checked{% endif %} onchange="toggleProfileMode()"> Quick Start</label>
+            <label><input type="radio" name="profile_mode" value="bib" {% if cur_bib_file %}checked{% endif %} onchange="toggleProfileMode()"> Use Bib File</label>
+          </div>
+          <div id="quick-mode" {% if cur_bib_file %}style="display:none"{% endif %}>
+            <label>Arxiv Categories</label>
+            <div class="checkbox-grid">
+              <label><input type="checkbox" name="categories" value="astro-ph.GA" {% if 'astro-ph.GA' in cur_categories %}checked{% endif %}> astro-ph.GA</label>
+              <label><input type="checkbox" name="categories" value="astro-ph.SR" {% if 'astro-ph.SR' in cur_categories %}checked{% endif %}> astro-ph.SR</label>
+              <label><input type="checkbox" name="categories" value="astro-ph.HE" {% if 'astro-ph.HE' in cur_categories %}checked{% endif %}> astro-ph.HE</label>
+              <label><input type="checkbox" name="categories" value="astro-ph.CO" {% if 'astro-ph.CO' in cur_categories %}checked{% endif %}> astro-ph.CO</label>
+              <label><input type="checkbox" name="categories" value="astro-ph.IM" {% if 'astro-ph.IM' in cur_categories %}checked{% endif %}> astro-ph.IM</label>
+              <label><input type="checkbox" name="categories" value="astro-ph.EP" {% if 'astro-ph.EP' in cur_categories %}checked{% endif %}> astro-ph.EP</label>
+            </div>
+            <label for="keywords">Keywords (comma-separated)</label>
+            <textarea id="keywords" name="keywords" placeholder="e.g. first stars, chemical evolution, supernova, stellar abundances">{{ cur_keywords or '' }}</textarea>
+            <p class="hint">These help filter and rank papers relevant to your research.</p>
+          </div>
+          <div id="bib-mode" {% if not cur_bib_file %}style="display:none"{% endif %}>
+            <label>Upload your .bib file</label>
+            <input type="file" name="bib_file" accept=".bib" style="width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:6px;font-size:14px">
+            <label for="bib_path" style="margin-top:10px">Or enter a file path</label>
+            <input type="text" id="bib_path" name="bib_path" placeholder="/path/to/your/collection.bib" value="{{ cur_bib_file or '' }}">
+            <p class="hint">Your research profile is extracted automatically from the bibliography.</p>
+          </div>
+          <div class="row">
+            <button class="btn btn-primary" type="submit">Save Changes</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-email">
+      <div class="card">
+        <h2>Email Notification</h2>
+        <p class="sub">Daily email reminders for new papers.</p>
+        <div class="notice">Email notification is under development and currently disabled. Stay tuned.</div>
+        <label class="check-line" style="margin-top:16px;color:#999;cursor:not-allowed">
+          <input type="checkbox" disabled> Enable email notification
+        </label>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-learned">
+      <div class="card">
+        <h2>Learned Preferences</h2>
+        <p class="sub">Learned from your Overrated / Underrated feedback; you can also adjust manually. Weight &gt; 1 = more relevant, &lt; 1 = less relevant, 1 = no effect.</p>
+        <p class="hint">Auto = learned from your feedback; Manual = your own value (takes priority over auto). Ignore = stop this item from affecting scores; Restore auto = drop the manual value and return to the learned result.</p>
+        <div id="learned-content">Loading…</div>
+        <div class="row">
+          <button class="btn btn-primary" type="button" id="btn-reset-learned" onclick="resetLearned()">Reset All</button>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+<script>
+function updateProvider() {
+  const p = document.getElementById('provider').value;
+  const model = document.getElementById('model');
+  const urlGroup = document.getElementById('baseurl-group');
+  const baseUrl = document.getElementById('base_url');
+  if (p === 'deepseek') { model.value = 'deepseek-v4-flash'; urlGroup.style.display = 'none'; }
+  else if (p === 'openai') { model.value = 'gpt-4o-mini'; urlGroup.style.display = 'none'; }
+  else { model.value = ''; urlGroup.style.display = 'block'; baseUrl.focus(); }
+}
+function toggleProfileMode() {
+  const mode = document.querySelector('input[name="profile_mode"]:checked').value;
+  document.getElementById('quick-mode').style.display = mode === 'quick' ? '' : 'none';
+  document.getElementById('bib-mode').style.display = mode === 'bib' ? '' : 'none';
+}
+(function () {
+  const provider = document.getElementById('provider');
+  if (provider && provider.value === 'custom') {
+    document.getElementById('baseurl-group').style.display = 'block';
+  }
+})();
+</script>
+<script>
+(function () {
+  const SECTIONS = ["general", "llm", "interests", "learned", "email"];
+  function activate(name) {
+    const requested = name;
+    if (name === "update") name = "general";
+    if (SECTIONS.indexOf(name) < 0) name = "general";
+    const panels = document.querySelectorAll(".panel");
+    for (let i = 0; i < panels.length; i++) panels[i].classList.remove("active");
+    const panel = document.getElementById("panel-" + name);
+    if (panel) panel.classList.add("active");
+    const items = document.querySelectorAll(".nav-item");
+    for (let j = 0; j < items.length; j++) {
+      items[j].classList.toggle("active", items[j].getAttribute("data-section") === name);
+    }
+    if (history.replaceState) history.replaceState(null, "", "#" + name);
+    if (name === "general" && requested === "update") {
+      const upd = document.getElementById("update");
+      if (upd) setTimeout(function () { upd.scrollIntoView({behavior: "smooth", block: "start"}); }, 60);
+    }
+  }
+  window.activate = activate;
+  window.addEventListener("hashchange", function () { activate(location.hash.slice(1)); });
+  activate(location.hash.slice(1) || "general");
+})();
+</script>
+<script>
+(function () {
+  function saveGeneral() {
+    const cross = document.getElementById("pref-cross").checked;
+    const repl = document.getElementById("pref-repl").checked;
+    const auto = document.getElementById("auto-check-updates").checked;
+    fetch("/preferences", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({include_cross: cross, include_replacements: repl, auto_check_updates: auto})
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      const btn = document.getElementById("btn-save-general");
+      if (btn) {
+        const old = btn.textContent;
+        btn.textContent = d.ok ? "Saved" : "Failed";
+        setTimeout(function () { btn.textContent = old; }, 1500);
+      }
+    }).catch(function () {});
+  }
+  window.saveGeneral = saveGeneral;
+})();
+</script>
+<script>
+(function () {
+  const content = document.getElementById('learned-content');
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+  function rowHtml(kind, term, meta) {
+    const w = (meta && meta.weight != null) ? meta.weight : 1.0;
+    const manual = meta && meta.origin === 'manual';
+    const source = meta && meta.source ? meta.source : '';
+    const badge = manual
+      ? '<span class="lp-badge lp-manual">manual</span>'
+      : '<span class="lp-badge lp-auto">auto</span>';
+    const srcHtml = source ? '<span class="lp-source">Source: ' + esc(source) + '</span>' : '';
+    const secondary = manual
+      ? '<button class="lp-btn" data-op="revert" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '">Restore auto</button>'
+      : '<button class="lp-btn danger" data-op="ignore" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '">Ignore</button>';
+    return '<tr>' +
+      '<td>' + esc(term) + badge + srcHtml + '</td>' +
+      '<td><input type="number" step="0.05" min="0.5" max="2" value="' + w + '" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '"></td>' +
+      '<td><button class="lp-btn" data-op="set" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '">Save</button>' + secondary + '</td>' +
+      '</tr>';
+  }
+  function ignoredRowHtml(kind, term) {
+    return '<tr><td>' + esc(term) + ' <span class="lp-badge lp-ignored">ignored</span><span class="lp-source">no longer affects scoring</span></td>' +
+      '<td><button class="lp-btn" data-op="revert" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '">Restore</button></td></tr>';
+  }
+  function render(profile) {
+    if (!profile) { content.textContent = 'No learned preferences yet.'; return; }
+    const kw = profile.keyword_weights || {};
+    const cw = profile.category_weights || {};
+    const cal = profile.global_calibration || 0;
+    const manual = profile.manual || {};
+    const mkw = manual.keyword_weights || {};
+    const mcat = manual.category_weights || {};
+
+    let html = '<div class="lp-cal">Global calibration: <strong>' + (cal > 0 ? '+' : '') + cal.toFixed(2) + '</strong> points (positive = shift scores up, negative = down)</div>';
+
+    const kwKeys = Object.keys(kw);
+    if (kwKeys.length) {
+      html += '<h3 style="font-size:14px;margin:12px 0 4px">Topic keyword weights</h3>';
+      html += '<table class="lp-table"><thead><tr><th>Topic</th><th>Weight</th><th>Actions</th></tr></thead><tbody>';
+      kwKeys.sort().forEach(function (t) { html += rowHtml('keyword_weights', t, kw[t]); });
+      html += '</tbody></table>';
+    }
+    const cwKeys = Object.keys(cw);
+    if (cwKeys.length) {
+      html += '<h3 style="font-size:14px;margin:12px 0 4px">arXiv category weights</h3>';
+      html += '<table class="lp-table"><thead><tr><th>Category</th><th>Weight</th><th>Actions</th></tr></thead><tbody>';
+      cwKeys.sort().forEach(function (c) { html += rowHtml('category_weights', c, cw[c]); });
+      html += '</tbody></table>';
+    }
+    if (!kwKeys.length && !cwKeys.length) {
+      html += '<p class="lp-empty">No learned weights yet. Mark papers Overrated / Underrated in a digest to build them.</p>';
+    }
+
+    const ignoredKw = Object.keys(mkw).filter(function (t) { return mkw[t] === null; });
+    const ignoredCat = Object.keys(mcat).filter(function (c) { return mcat[c] === null; });
+    if (ignoredKw.length || ignoredCat.length) {
+      html += '<h3 style="font-size:14px;margin:16px 0 4px">Ignored (no longer affects scoring)</h3>';
+      html += '<table class="lp-table"><thead><tr><th>Item</th><th>Actions</th></tr></thead><tbody>';
+      ignoredKw.sort().forEach(function (t) { html += ignoredRowHtml('keyword_weights', t); });
+      ignoredCat.sort().forEach(function (c) { html += ignoredRowHtml('category_weights', c); });
+      html += '</tbody></table>';
+    }
+    content.innerHTML = html;
+  }
+  function load() {
+    fetch('/learned-profile').then(function (r) { return r.json(); }).then(render).catch(function () {
+      content.textContent = 'Failed to load.';
+    });
+  }
+  function post(kind, term, op, weight) {
+    fetch('/learned-profile', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({kind: kind, term: term, op: op, weight: weight})
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (d.ok) render(d.profile);
+    }).catch(function () {});
+  }
+  content.addEventListener('click', function (ev) {
+    const btn = ev.target.closest('button');
+    if (!btn) return;
+    const kind = btn.getAttribute('data-kind');
+    const term = btn.getAttribute('data-term');
+    const op = btn.getAttribute('data-op');
+    if (!kind || !term || !op) return;
+    if (op === 'set') {
+      const input = content.querySelector('input[data-kind="' + CSS.escape(kind) + '"][data-term="' + CSS.escape(term) + '"]');
+      if (!input) return;
+      const v = parseFloat(input.value);
+      if (!isFinite(v)) return;
+      post(kind, term, 'set', v);
+    } else {
+      post(kind, term, op);
+    }
+  });
+  window.resetLearned = function () {
+    if (!confirm('Reset all learned preferences? This clears your feedback history, manual settings and ignored items.')) return;
+    fetch('/learned-profile/reset', {method: 'POST'}).then(function (r) { return r.json(); }).then(function (d) {
+      if (d.ok) render(d.profile);
+    });
+  };
+  load();
+})();
+</script>
+<script>
+(function () {
+  const statusEl = document.getElementById("update-status");
+  const notesEl = document.getElementById("update-notes");
+  const progressWrap = document.getElementById("update-progress");
+  const progressBar = document.getElementById("update-progress-bar");
+  const btnCheck = document.getElementById("btn-check-update");
+  const btnDownload = document.getElementById("btn-download-update");
+  const btnApply = document.getElementById("btn-apply-update");
+
+  function render(s) {
+    if (!s) return;
+    if (s.status === "checking") {
+      statusEl.textContent = "Checking for updates…";
+      btnCheck.disabled = true;
+    } else if (s.status === "available") {
+      statusEl.textContent = "New version v" + s.latest + " available (current v" + s.current + ")";
+      notesEl.style.display = "block";
+      notesEl.textContent = s.notes || "(No release notes)";
+      btnDownload.style.display = "inline-block";
+      btnApply.style.display = "none";
+    } else if (s.status === "up_to_date") {
+      statusEl.textContent = "You are up to date (v" + s.current + ")";
+      notesEl.style.display = "none";
+    } else if (s.status === "downloading") {
+      statusEl.textContent = "Downloading v" + s.latest + "… " + s.progress + "%";
+      progressWrap.style.display = "block";
+      progressBar.style.width = s.progress + "%";
+    } else if (s.status === "ready") {
+      statusEl.textContent = "Download complete and verified. Click Install & Restart to install v" + s.latest + ".";
+      progressWrap.style.display = "none";
+      btnDownload.style.display = "none";
+      btnApply.style.display = "inline-block";
+    } else if (s.status === "installing") {
+      statusEl.textContent = "Installing — the app will restart…";
+      btnCheck.disabled = true;
+      btnApply.disabled = true;
+    } else if (s.status === "error") {
+      statusEl.textContent = s.error || "Update check failed";
+      btnCheck.disabled = false;
+    } else {
+      statusEl.textContent = "—";
+    }
+  }
+
+  function poll() {
+    fetch("/update/status").then(function (r) { return r.json(); }).then(function (s) {
+      render(s);
+      if (s && ["checking", "downloading", "installing"].indexOf(s.status) >= 0) {
+        setTimeout(poll, 1000);
+      }
+    }).catch(function () {});
+  }
+
+  btnCheck.addEventListener("click", function () {
+    statusEl.textContent = "Checking for updates…";
+    btnCheck.disabled = true;
+    fetch("/update/check", {method: "POST", cache: "no-store"})
+      .then(function (r) { return r.json(); })
+      .then(function (s) {
+        if (s && s.error) { statusEl.textContent = s.error; btnCheck.disabled = false; return; }
+        render(s);
+        btnCheck.disabled = false;
+      })
+      .catch(function () { statusEl.textContent = "Check failed. Please try again later."; btnCheck.disabled = false; });
+  });
+
+  btnDownload.addEventListener("click", function () {
+    fetch("/update/download", {method: "POST", cache: "no-store"})
+      .then(function (r) { return r.json(); })
+      .then(function (d) { if (!d.ok && d.error) alert(d.error); poll(); })
+      .catch(function () {});
+  });
+
+  btnApply.addEventListener("click", function () {
+    if (!confirm("Install the new version and restart the app? Your current code will be backed up automatically.")) return;
+    btnApply.disabled = true;
+    fetch("/update/apply", {method: "POST", cache: "no-store"})
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d.ok && d.error) { alert(d.error); btnApply.disabled = false; return; }
+        statusEl.textContent = "Installing — the app will restart…";
+        poll();
+      })
+      .catch(function () {});
+  });
+
+  poll();
+})();
 </script>
 </body>
 </html>"""
@@ -582,11 +1386,20 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .date-arrow{background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:default;font-size:15px;line-height:1;opacity:.5}
 .btn-today{background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px;font-weight:600}
 .btn-today:hover{background:rgba(255,255,255,.3)}
-.loading-area{text-align:center;padding:80px 20px;color:#999}
-.loading-area .spinner{width:40px;height:40px;border:3px solid #e0e0e0;border-top-color:#3498db;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 20px}
-@keyframes spin{to{transform:rotate(360deg)}}
-.loading-area .msg{color:#888;font-size:15px;margin-bottom:8px}
+.loading-area{text-align:center;padding:70px 20px;color:#999}
+.stage-label{font-size:19px;font-weight:700;color:#2c3e50;margin-bottom:12px}
+.progress-wrap{width:100%;max-width:560px;height:14px;margin:0 auto 10px;background:#e2e8f0;border-radius:999px;overflow:hidden;position:relative}
+.progress-bar{height:100%;width:0;background:linear-gradient(90deg,#2563eb,#38bdf8);border-radius:999px;transition:width .4s ease}
+.progress-bar.indeterminate{width:35%;animation:indet 1.2s ease-in-out infinite}
+@keyframes indet{0%{transform:translateX(-120%)}100%{transform:translateX(400%)}}
+.progress-bar.error{width:100%;background:linear-gradient(90deg,#dc2626,#f87171)}
+.progress-meta{display:flex;justify-content:center;gap:20px;font-size:13px;color:#888;margin-bottom:6px}
+.loading-area .msg{color:#555;font-size:15px;margin-bottom:8px}
 .loading-area .error{color:#e74c3c;font-size:13px;max-width:600px;margin:16px auto 0;text-align:left;background:rgba(231,76,60,.08);padding:16px;border-radius:8px;white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto}
+.log-toggle{margin-top:20px;font-size:13px;color:#2563eb;cursor:pointer;user-select:none;display:none}
+.log-box{display:none;max-width:640px;margin:10px auto 0;text-align:left;background:#0f172a;color:#cbd5e1;border-radius:8px;padding:12px 14px;font-size:12px;line-height:1.5;max-height:220px;overflow-y:auto}
+.log-box div{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,Consolas,monospace}
+.log-line-error{color:#fca5a5;font-weight:600}
 .btn{margin-top:20px;padding:10px 24px;background:#3498db;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer}
 .btn:hover{background:#2980b9}
 </style>
@@ -613,9 +1426,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 </div>
 <div class="loading-area">
-  <div class="spinner" id="spinner"></div>
+  <div class="stage-label" id="stage-label">Starting…</div>
+  <div class="progress-wrap"><div class="progress-bar indeterminate" id="progress-bar"></div></div>
+  <div class="progress-meta">
+    <span id="pct">In progress…</span>
+    <span id="elapsed">Elapsed 0s</span>
+  </div>
   <p class="msg" id="msg">Starting pipeline...</p>
   <div class="error" id="error" style="display:none"></div>
+  <div class="log-toggle" id="log-toggle" onclick="toggleLog()">▸ View run log</div>
+  <div class="log-box" id="log-box"><div id="log-content"></div></div>
   <button class="btn" id="retry" style="display:none" onclick="location.href='/run?date={{ display_date }}'">Retry</button>
   <button class="btn" id="back" style="display:none;margin-left:10px;background:#7f8c8d" onclick="location.href='/digest/{{ display_date }}'">Back to Digest</button>
 </div>
@@ -666,20 +1486,100 @@ function goToToday() {
   const d = String(now.getDate()).padStart(2,'0');
   navigateToDate(y + '-' + m + '-' + d);
 }
+let startTs = null;
+let elapsedTimer = null;
+
+function fmtTime(sec) {
+  if (sec < 60) return sec + 's';
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m + 'm ' + s + 's';
+}
+
+function renderStatus(d) {
+  const bar = document.getElementById('progress-bar');
+  const pctEl = document.getElementById('pct');
+  const stageEl = document.getElementById('stage-label');
+  const msgEl = document.getElementById('msg');
+  const errEl = document.getElementById('error');
+  const retryEl = document.getElementById('retry');
+  const backEl = document.getElementById('back');
+  const logToggle = document.getElementById('log-toggle');
+  const logBox = document.getElementById('log-box');
+  const logContent = document.getElementById('log-content');
+
+  stageEl.textContent = d.stage_label || 'Starting…';
+  msgEl.textContent = d.message || '';
+  bar.classList.remove('indeterminate', 'error');
+  bar.style.width = '';
+
+  if (d.status === 'error') {
+    bar.classList.add('error');
+    pctEl.textContent = 'Failed';
+    errEl.style.display = 'block';
+    errEl.textContent = d.message || 'Pipeline failed.';
+    retryEl.style.display = 'inline-block';
+    backEl.style.display = 'inline-block';
+  } else if (d.status === 'done') {
+    bar.style.width = '100%';
+    pctEl.textContent = '100%';
+  } else {
+    if (d.total > 0) {
+      const pct = Math.round(100 * d.done / d.total);
+      bar.style.width = pct + '%';
+      pctEl.textContent = pct + '%';
+    } else {
+      bar.classList.add('indeterminate');
+      pctEl.textContent = 'In progress…';
+    }
+  }
+
+  if (d.log && d.log.length) {
+    logToggle.style.display = 'block';
+    logContent.innerHTML = d.log.map(function (line) {
+      const esc = String(line).replace(/[&<>"']/g, function (c) {
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+      });
+      const isErr = /error|traceback|failed|exception/i.test(line);
+      return '<div class="' + (isErr ? 'log-line-error' : '') + '">' + esc + '</div>';
+    }).join('');
+    logBox.scrollTop = logBox.scrollHeight;
+    if (d.status === 'error') {
+      logBox.style.display = 'block';
+      logToggle.textContent = '▾ Hide run log';
+    }
+  }
+
+  if (d.status === 'running') {
+    if (startTs === null) startTs = Date.now() - (d.elapsed || 0) * 1000;
+    if (!elapsedTimer) {
+      elapsedTimer = setInterval(function () {
+        document.getElementById('elapsed').textContent = 'Elapsed ' + fmtTime(Math.floor((Date.now() - startTs) / 1000));
+      }, 1000);
+    }
+  } else if (elapsedTimer) {
+    clearInterval(elapsedTimer);
+    elapsedTimer = null;
+  }
+}
+
+function toggleLog() {
+  const box = document.getElementById('log-box');
+  const toggle = document.getElementById('log-toggle');
+  const open = box.style.display === 'block';
+  box.style.display = open ? 'none' : 'block';
+  toggle.textContent = open ? '▸ View run log' : '▾ Hide run log';
+  if (!open) box.scrollTop = box.scrollHeight;
+}
+
 function poll() {
   fetch('/status').then(r=>r.json()).then(d=>{
-    document.getElementById('msg').textContent = d.message;
-    if(d.status === 'done') {
-      window.location.href = '/digest';
-    } else if(d.status === 'error') {
-      document.getElementById('spinner').style.display = 'none';
-      document.getElementById('error').style.display = 'block';
-      document.getElementById('error').textContent = d.message;
-      document.getElementById('retry').style.display = 'inline-block';
-      document.getElementById('back').style.display = 'inline-block';
-      document.getElementById('msg').textContent = 'Pipeline failed.';
+    renderStatus(d);
+    if (d.status === 'done') {
+      setTimeout(function () { window.location.href = '/digest'; }, 900);
+    } else if (d.status === 'error') {
+      // stay on this page; Retry / Back to Digest buttons are shown
     } else {
-      setTimeout(poll, 2000);
+      setTimeout(poll, 1500);
     }
   }).catch(()=>setTimeout(poll, 3000));
 }
@@ -717,6 +1617,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .card-title{font-size:15px;font-weight:600;color:#2c3e50;margin-bottom:6px;display:flex;align-items:flex-start;gap:10px}
 .score-badge{display:inline-block;min-width:38px;text-align:center;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:700;color:#fff;flex-shrink:0}
 .score-high{background:#27ae60}.score-mid{background:#f39c12}.score-low{background:#e74c3c}
+.adj-badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:700;flex-shrink:0}
+.adj-pos{background:#e8f5e9;color:#2e7d32}
+.adj-neg{background:#fdecea;color:#c62828}
 .card-reason{font-size:13px;color:#666;margin-bottom:4px}
 .card-meta{font-size:12px;color:#999;margin-bottom:8px}
 .card-abstract{font-size:13px;color:#555;line-height:1.5;margin-bottom:10px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
@@ -776,7 +1679,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   {% for paper in tier.papers %}
   <div class="card" id="card-{{ paper.paper_id | replace('.', '-') }}" data-paper-type="{{ paper.paper_type | default('new') }}">
     <div class="card-title">
+      {% if paper.scoring_failed %}
+      <span class="score-badge score-low" style="background:#dc2626">No score</span>
+      {% else %}
       <span class="score-badge {% if paper.score >= 7 %}score-high{% elif paper.score >= 5 %}score-mid{% else %}score-low{% endif %}">{{ paper.score }}/10</span>
+      {% if paper.score_adjustment %}<span class="adj-badge {% if paper.score_adjustment > 0 %}adj-pos{% else %}adj-neg{% endif %}" title="Preference adjustment (relative to LLM raw score)">{{ '%+.1f' | format(paper.score_adjustment) }}</span>{% endif %}
+      {% endif %}
       <span>{{ paper.title }}</span>
     </div>
     {% if paper.reason %}<div class="card-reason">{{ paper.reason }}</div>{% endif %}
@@ -792,11 +1700,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 {% endfor %}
 </div>
 <script>
+const DIGEST_DATE = {{ digest.date | tojson }};
 function giveFeedback(btn, action) {
   const id = btn.dataset.id, title = btn.dataset.title, score = btn.dataset.score;
   const wasActive = btn.classList.contains('active');
   fetch('/feedback', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({paper_id:id, title:title, action: wasActive ? 'cancel' : action, original_score:parseInt(score)})
+    body: JSON.stringify({paper_id:id, title:title, action: wasActive ? 'cancel' : action, original_score:parseInt(score), date: DIGEST_DATE})
   }).then(r=>r.json()).then(d=>{
     if(d.ok){
       const parent = btn.parentElement;
@@ -1106,9 +2015,9 @@ def _render_digest(digest=None):
         status = d.get("status", "no_papers")
         is_today = (d.get("date", "") == today_str)
         if status == "no_announcement":
-            msg = "arXiv 当日无公布批次（周末不公布 / 节假日顺延）"
+            msg = "No arXiv announcement on this day (no weekend announcements / holiday deferral)"
         elif status == "deferred_or_lagging":
-            msg = "该日批次疑似顺延（节假日）或页面滞后，暂无内容"
+            msg = "This day's batch may be deferred (holiday) or the listing lags; no content yet"
         elif is_today and status == "no_papers":
             msg = "No available papers (today's arxiv has not been updated yet)"
         elif is_today and status == "no_new_papers":
@@ -1130,175 +2039,75 @@ def _render_digest(digest=None):
 
 
 @app.route("/setup", methods=["GET"])
-@app.route("/settings", methods=["GET"])
 def setup_page():
-    """Show the setup/settings page."""
-    import yaml
-    # Try to load current config for pre-filling
-    cfg = {}
-    config_path = os.path.join(_PROJECT_DIR, "config.yaml")
-    if os.path.exists(config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-    # Read .env for API key
-    env_vars = {}
-    env_path = os.path.join(_PROJECT_DIR, ".env")
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    env_vars[k.strip()] = v.strip().strip('"')
-    email_cfg = cfg.get("email", {})
-    llm_cfg = cfg.get("llm", {})
-    return render_template_string(SETUP_TEMPLATE,
-        cur_model=llm_cfg.get("model", "deepseek-chat"),
-        cur_base_url=llm_cfg.get("base_url", ""),
-        cur_api_key=env_vars.get("DEEPSEEK_API_KEY", env_vars.get("OPENAI_API_KEY", env_vars.get("CUSTOM_API_KEY", ""))),
-        cur_categories=cfg.get("arxiv_categories", []),
-        cur_keywords=", ".join(cfg.get("keywords", [])),
-        cur_bib_file=cfg.get("bib_file", ""),
-        cur_email_sender=email_cfg.get("sender", ""),
-        cur_email_recipient=email_cfg.get("recipient", ""),
-        cur_smtp_server=email_cfg.get("smtp_server", ""),
-        cur_smtp_port=str(email_cfg.get("smtp_port", "465")),
-        cur_use_ssl=email_cfg.get("use_ssl", True),
-        cur_email_enabled=email_cfg.get("enabled", False),
-        cur_email_password=env_vars.get("EMAIL_APP_PASSWORD", ""),
-    )
+    """Show the first-run setup wizard (no update module)."""
+    return render_template_string(SETUP_TEMPLATE, **_setup_context())
+
+
+@app.route("/settings", methods=["GET"])
+def settings_page():
+    """Show the two-column settings page with per-section panels."""
+    context = _setup_context()
+    context["prefs"] = load_preferences()
+    context["current_version"] = updater.get_current_version()
+    return render_template_string(SETTINGS_TEMPLATE, **context)
 
 
 @app.route("/setup", methods=["POST"])
 def setup_submit():
-    """Process setup form and write configuration."""
-    import yaml
-
-    provider = request.form.get("provider", "deepseek")
+    """Process the first-run wizard form and write configuration."""
+    config, env_values = _load_config_and_env()
     api_key = request.form.get("api_key", "").strip()
-    model = request.form.get("model", "").strip()
-    base_url = request.form.get("base_url", "").strip()
-    profile_mode = request.form.get("profile_mode", "quick")
-    categories = request.form.getlist("categories")
-    keywords_raw = request.form.get("keywords", "").strip()
-    bib_path = request.form.get("bib_path", "").strip()
-    enable_email = request.form.get("enable_email") == "on"
-    email_sender = request.form.get("email_sender", "").strip()
-    email_recipient = request.form.get("email_recipient", "").strip()
-    smtp_server = request.form.get("smtp_server", "").strip()
-    smtp_protocol = request.form.get("smtp_protocol", "ssl")
-    smtp_port_value = request.form.get("smtp_port", "").strip()
-    email_password = request.form.get("email_password", "").strip()
-
-    # Determine API key env var name and base URL
-    if provider == "deepseek":
-        api_key_env = "DEEPSEEK_API_KEY"
-        base_url = "https://api.deepseek.com"
-    elif provider == "openai":
-        api_key_env = "OPENAI_API_KEY"
-        base_url = "https://api.openai.com/v1"
-    else:
-        api_key_env = "CUSTOM_API_KEY"
-
-    if provider == "custom" and not base_url:
-        abort(400, "Base URL is required for a custom provider.")
-    if not model:
-        abort(400, "Model name is required.")
-
-    # Only parse/validate SMTP settings when email notification is enabled.
-    smtp_port = 465 if smtp_protocol == "ssl" else 587
-    if enable_email:
-        try:
-            smtp_port = int(smtp_port_value) if smtp_port_value else (
-                465 if smtp_protocol == "ssl" else 587
-            )
-        except ValueError:
-            abort(400, "SMTP port must be an integer.")
-        if not 1 <= smtp_port <= 65535:
-            abort(400, "SMTP port must be between 1 and 65535.")
-
-    # Write .env file.  Preserve existing entries (other provider keys and
-    # any previously saved email values) and only update what this submission
-    # changes, so disabling email doesn't wipe credentials.
-    env_path = os.path.join(_PROJECT_DIR, ".env")
-    env_values = {}
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    env_values[k.strip()] = v.strip().strip('"').strip("'")
-
-    env_values[api_key_env] = api_key
-    if enable_email:
-        env_values["EMAIL_APP_PASSWORD"] = email_password
-        env_values["EMAIL_SENDER"] = email_sender
-        env_values["EMAIL_RECIPIENT"] = email_recipient or email_sender
-        env_values["SMTP_SERVER"] = smtp_server
-        env_values["SMTP_PORT"] = str(smtp_port)
-
-    with open(env_path, "w", encoding="utf-8") as f:
-        for key, value in env_values.items():
-            escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-            f.write(f'{key}="{escaped}"\n')
-    os.chmod(env_path, 0o600)
-
-    # Load existing config and update
-    config_path = os.path.join(_PROJECT_DIR, "config.yaml")
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    # Update LLM config
-    config["llm"]["base_url"] = base_url
-    config["llm"]["api_key_env"] = api_key_env
-    config["llm"]["model"] = model
-
-    # Update research interests
-    if profile_mode == "quick":
-        if categories:
-            config["arxiv_categories"] = categories
-        if keywords_raw:
-            keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
-            config["keywords"] = keywords
-    else:
-        # Handle bib file upload or path
-        bib_file = request.files.get("bib_file")
-        if bib_file and bib_file.filename:
-            data_dir = os.path.join(_PROJECT_DIR, "data")
-            os.makedirs(data_dir, exist_ok=True)
-            filename = secure_filename(bib_file.filename)
-            if not filename:
-                abort(400, "Invalid BibTeX filename.")
-            bib_file.save(os.path.join(data_dir, filename))
-            config["bib_file"] = f"data/{filename}"
-        elif bib_path:
-            config["bib_file"] = bib_path
-
-    # Update email config
-    if enable_email and email_sender and smtp_server:
-        config["email"]["enabled"] = True
-        config["email"]["sender"] = email_sender
-        config["email"]["recipient"] = email_recipient or email_sender
-        config["email"]["smtp_server"] = smtp_server
-        config["email"]["use_ssl"] = (smtp_protocol == "ssl")
-        config["email"]["smtp_port"] = smtp_port
-        config["email"]["password_env"] = "EMAIL_APP_PASSWORD"
-    else:
-        # Email disabled (or incomplete): turn notifications off without
-        # wiping previously saved credentials.
-        config["email"]["enabled"] = False
-
-    # Write updated config
-    with open(config_path, "w", encoding="utf-8") as f:
-        yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-
-    # Reload env for current process
+    api_key_env = _apply_llm(
+        config, env_values,
+        provider=request.form.get("provider", "deepseek"),
+        api_key=api_key,
+        model=request.form.get("model", "").strip(),
+        base_url=request.form.get("base_url", "").strip(),
+    )
+    _apply_interests(config, request)
+    _apply_email(
+        config, env_values,
+        enable_email=request.form.get("enable_email") == "on",
+        email_sender=request.form.get("email_sender", "").strip(),
+        email_recipient=request.form.get("email_recipient", "").strip(),
+        smtp_server=request.form.get("smtp_server", "").strip(),
+        smtp_protocol=request.form.get("smtp_protocol", "ssl"),
+        smtp_port_value=request.form.get("smtp_port", "").strip(),
+        email_password=request.form.get("email_password", "").strip(),
+    )
+    _write_env(env_values)
+    _write_config(config)
     os.environ[api_key_env] = api_key
-
     return redirect("/")
 
 
+@app.route("/settings/save", methods=["POST"])
+def settings_save():
+    """Save one settings section (llm | interests) and return to its panel."""
+    section = request.args.get("section", "")
+    config, env_values = _load_config_and_env()
+
+    if section == "llm":
+        api_key = request.form.get("api_key", "").strip()
+        api_key_env = _apply_llm(
+            config, env_values,
+            provider=request.form.get("provider", "deepseek"),
+            api_key=api_key,
+            model=request.form.get("model", "").strip(),
+            base_url=request.form.get("base_url", "").strip(),
+        )
+        _write_env(env_values)
+        _write_config(config)
+        os.environ[api_key_env] = api_key
+        return redirect("/settings#llm")
+
+    if section == "interests":
+        _apply_interests(config, request)
+        _write_config(config)
+        return redirect("/settings#interests")
+
+    abort(400, "Unknown settings section.")
 @app.route("/")
 def index():
     """Landing page: show last viewed or latest digest."""
@@ -1387,10 +2196,20 @@ def digest_by_date(date_str):
 @app.route("/status")
 def status():
     """JSON status endpoint for polling."""
+    elapsed = 0
+    if _pipeline_started_at is not None:
+        elapsed = int(time.time() - _pipeline_started_at)
+    stage = _pipeline_progress.get("stage", "")
     return jsonify({
         "app": "AstroPaperDigest",
         "status": _pipeline_status,
         "message": _pipeline_message,
+        "stage": stage,
+        "stage_label": _STAGE_LABELS.get(stage, ""),
+        "done": _pipeline_progress.get("done", 0),
+        "total": _pipeline_progress.get("total", 0),
+        "elapsed": elapsed,
+        "log": list(_pipeline_log)[-15:],
     })
 
 
@@ -1433,6 +2252,10 @@ def post_preferences():
         except (TypeError, ValueError):
             abort(400, "Date must use YYYY-MM-DD format.")
         prefs["last_viewed_date"] = data["last_viewed_date"]
+    if isinstance(data.get("auto_check_updates"), bool):
+        prefs["auto_check_updates"] = data["auto_check_updates"]
+    if "dismissed_update_version" in data:
+        prefs["dismissed_update_version"] = str(data["dismissed_update_version"])
     save_preferences(prefs)
     return jsonify({"ok": True, "preferences": prefs})
 
@@ -1454,6 +2277,38 @@ def post_feedback():
     if action not in {"overrated", "underrated", "cancel"}:
         abort(400, "Invalid feedback action.")
 
+    # Which digest does this feedback refer to? The page sends its rendered date.
+    date_str = ""
+    raw_date = data.get("date", "")
+    if isinstance(raw_date, str) and raw_date:
+        try:
+            date.fromisoformat(raw_date)
+            date_str = raw_date
+        except ValueError:
+            date_str = ""
+    if not date_str:
+        date_str = (_current_digest.get("date") or _digest_today_str()) if _current_digest else _digest_today_str()
+
+    # Enrich the feedback with categories + abstract snippet so the learned
+    # profile can extract meaningful topic signals later.
+    categories = []
+    abstract_snippet = ""
+    digest_path = get_digest_path_for_date(date_str)
+    if digest_path:
+        d = parse_digest(digest_path)
+        for tier in d.get("tiers", []):
+            for p in tier.get("papers", []):
+                if p.get("paper_id") == paper_id:
+                    cats = p.get("categories", "")
+                    if isinstance(cats, str):
+                        categories = [c.strip() for c in cats.split(",") if c.strip()]
+                    elif isinstance(cats, list):
+                        categories = [str(c).strip() for c in cats if str(c).strip()]
+                    abstract_snippet = (p.get("abstract") or "")[:500]
+                    break
+            if categories or abstract_snippet:
+                break
+
     feedback = load_feedback()
     feedback = [fb for fb in feedback if fb.get("paper_id") != paper_id]
 
@@ -1463,11 +2318,169 @@ def post_feedback():
             "title": data.get("title", ""),
             "action": action,
             "original_score": data.get("original_score", 0),
-            "date": (_current_digest.get("date") or _digest_today_str()) if _current_digest else _digest_today_str(),
+            "categories": categories,
+            "abstract_snippet": abstract_snippet,
+            "date": date_str,
+            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         })
 
     save_feedback(feedback)
+
+    # Rebuild the learned profile so the next ranking uses the new feedback.
+    try:
+        cfg, _ = _load_config_and_env()
+        rebuild_learned_profile(config_keywords=cfg.get("keywords", []))
+    except Exception:
+        pass  # learned profile is best-effort; never break feedback recording
+
     return jsonify({"ok": True})
+
+
+@app.route("/learned-profile", methods=["GET"])
+def learned_profile_get():
+    """Return the learned preference profile (derive one if missing)."""
+    profile = load_learned_profile()
+    if profile is None:
+        cfg, _ = _load_config_and_env()
+        profile = rebuild_learned_profile(config_keywords=cfg.get("keywords", []))
+    return jsonify(profile)
+
+
+@app.route("/learned-profile", methods=["POST"])
+def learned_profile_update():
+    """Edit one learned-preference entry.
+
+    Body: {kind: "keyword_weights"|"category_weights", term: str,
+           op: "set"|"ignore"|"revert", weight: float (required for set)}
+    - set:    apply a manual weight (overrides the auto-learned value)
+    - ignore: hide/suppress the entry so it no longer affects scoring
+    - revert: remove the manual override / ignore so the entry goes back to auto
+    """
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        abort(400, "Expected a JSON object.")
+
+    kind = data.get("kind", "")
+    term = str(data.get("term", "")).strip()
+    op = data.get("op", "")
+    if kind not in ("keyword_weights", "category_weights"):
+        abort(400, "kind must be keyword_weights or category_weights.")
+    if not term:
+        abort(400, "term is required.")
+    if op not in ("set", "ignore", "revert"):
+        abort(400, "op must be set, ignore or revert.")
+
+    if kind == "keyword_weights":
+        term = term.lower()
+
+    profile = load_learned_profile()
+    manual = (profile or {}).get("manual", {}) or {}
+    m = dict(manual.get(kind, {}) or {})
+
+    if op == "revert":
+        m.pop(term, None)
+    elif op == "ignore":
+        m[term] = None
+    else:  # set
+        try:
+            w = float(data.get("weight"))
+        except (TypeError, ValueError):
+            abort(400, "weight must be a number for op=set.")
+        if not math.isfinite(w):
+            abort(400, "weight must be a finite number.")
+        m[term] = w
+
+    manual[kind] = m
+    cfg, _ = _load_config_and_env()
+    profile = rebuild_learned_profile(config_keywords=cfg.get("keywords", []),
+                                      manual=manual)
+    return jsonify({"ok": True, "profile": profile})
+
+
+@app.route("/learned-profile/reset", methods=["POST"])
+def learned_profile_reset():
+    """Clear feedback history, manual overrides and the learned profile."""
+    reset_learned_profile()
+    cfg, _ = _load_config_and_env()
+    profile = rebuild_learned_profile(config_keywords=cfg.get("keywords", []))
+    return jsonify({"ok": True, "profile": profile})
+
+
+@app.route("/update/status")
+def update_status():
+    """JSON status of the update checker (polled by banner/settings JS)."""
+    with _update_lock:
+        return jsonify(dict(_update_state))
+
+
+@app.route("/update/check", methods=["POST"])
+def update_check_now():
+    """Manually check for updates (from the settings page)."""
+    with _update_lock:
+        busy = _update_state.get("status") in ("checking", "downloading", "installing")
+    if busy:
+        return jsonify({"ok": False, "error": "Another update operation is already in progress."}), 409
+    _start_update_check()
+    with _update_lock:
+        return jsonify(dict(_update_state))
+
+
+@app.route("/update/download", methods=["POST"])
+def update_download():
+    """Start downloading the latest release zip (background)."""
+    with _update_lock:
+        if _update_state.get("status") != "available":
+            return jsonify({"ok": False, "error": "No update available to download."}), 400
+        url = _update_state.get("download_url") or ""
+        version = _update_state.get("latest") or ""
+        expected_sha = _update_state.get("sha256") or ""
+    if not url:
+        return jsonify({"ok": False, "error": "Missing download URL."}), 400
+    with _update_lock:
+        _update_state.update({"status": "downloading", "progress": 0})
+    Thread(target=_download_update, args=(url, version, expected_sha), daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/update/apply", methods=["POST"])
+def update_apply():
+    """Confirm install: write marker, spawn detached updater, restart."""
+    global _update_state
+    if _pipeline_status == "running":
+        return jsonify({"ok": False, "error": "The paper pipeline is running. Please wait for it to finish before updating."}), 409
+    with _update_lock:
+        if _update_state.get("status") != "ready":
+            return jsonify({"ok": False, "error": "There is no downloaded and verified update."}), 400
+        version = _update_state.get("latest") or ""
+        zip_path = updater.UPDATES_DIR / f"AstroPaperDigest-v{version}.zip"
+        if not zip_path.exists():
+            return jsonify({"ok": False, "error": "Update package file is missing."}), 400
+        _update_state["status"] = "installing"
+
+    marker = {
+        "version": version,
+        "zip_path": str(zip_path),
+        "server_pid": os.getpid(),
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    marker_path = _PROJECT_DIR / "pending_update.json"
+    with open(marker_path, "w", encoding="utf-8") as f:
+        json.dump(marker, f, indent=2, ensure_ascii=False)
+
+    log_path = updater.UPDATES_DIR / "apply.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = open(log_path, "a", encoding="utf-8")
+    subprocess.Popen(
+        [sys.executable, "-u", "src/updater.py", "--apply", str(marker_path)],
+        cwd=str(_PROJECT_DIR),
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    # Give the HTTP response time to flush, then shut the server down.
+    Timer(1.5, _terminate_server).start()
+    return jsonify({"ok": True, "message": "Installation started. The app will restart shortly."})
 
 
 def open_browser(port: int = 5123):
@@ -1512,6 +2525,10 @@ def main():
     else:
         _pipeline_status = "done"
         _pipeline_message = "Showing existing digest."
+
+    # Background update check on startup (silent on failure)
+    if load_preferences().get("auto_check_updates", True):
+        Thread(target=_start_update_check, daemon=True).start()
 
     # Open browser
     if not args.no_browser:

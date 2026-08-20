@@ -88,6 +88,8 @@ def _parse_single_paper(block: str) -> dict:
     paper = {
         "title": title,
         "score": 0,
+        "score_adjustment": 0.0,
+        "scoring_failed": False,
         "reason": "",
         "authors": "",
         "categories": "",
@@ -97,11 +99,23 @@ def _parse_single_paper(block: str) -> dict:
         "paper_type": paper_type,
     }
     
-    # Extract score and reason
-    score_match = re.search(r"\*\*Score:\*\* (\d+)/10 \| \*\*Reason:\*\* (.+)", block)
-    if score_match:
-        paper["score"] = int(score_match.group(1))
-        paper["reason"] = score_match.group(2).strip()
+    # Extract score and reason (No score for failed papers)
+    if re.search(r"\*\*Score:\*\* No score", block):
+        paper["score"] = 0
+        paper["scoring_failed"] = True
+        reason_match = re.search(r"\*\*Score:\*\* No score \| \*\*Reason:\*\* (.+)", block)
+        if reason_match:
+            paper["reason"] = reason_match.group(1).strip()
+    else:
+        score_match = re.search(r"\*\*Score:\*\* (\d+)/10 \| \*\*Reason:\*\* (.+)", block)
+        if score_match:
+            paper["score"] = int(score_match.group(1))
+            paper["reason"] = score_match.group(2).strip()
+
+    # Extract deterministic preference adjustment (added by ranker)
+    adj_match = re.search(r"\*\*Adjustment:\*\* ([+-]?\d+(?:\.\d+)?)", block)
+    if adj_match:
+        paper["score_adjustment"] = float(adj_match.group(1))
     
     # Extract authors
     authors_match = re.search(r"\*\*Authors:\*\* (.+)", block)

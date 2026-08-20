@@ -37,6 +37,11 @@ def paper_to_bibtex(paper: dict) -> str:
     title = _escape_bibtex(paper.get("title", ""))
     abstract = _escape_bibtex(paper.get("abstract", ""))
     reason = _escape_bibtex(paper.get("reason", ""))
+    scoring_failed = bool(paper.get("scoring_failed"))
+    if scoring_failed:
+        note_text = "No score (scoring failed)"
+    else:
+        note_text = f"Recommended: score {paper.get('score', 'N/A')}/10 - {reason}"
     
     bibtex = f"""@misc{{{entry_key},
   title = {{{{{title}}}}},
@@ -49,7 +54,7 @@ def paper_to_bibtex(paper: dict) -> str:
   url = {{{paper.get('pdf_url', '')}}},
   abstract = {{{{{abstract}}}}},
   archiveprefix = {{arXiv}},
-  note = {{Recommended: score {paper.get('score', 'N/A')}/10 - {reason}}}
+  note = {{{note_text}}}
 }}
 """
     return bibtex
@@ -186,7 +191,15 @@ def _paper_to_markdown_entry(paper: dict, brief: bool = False) -> list[str]:
     lines = [
         f"### {paper['title']}{type_indicator}",
         "",
-        f"**Score:** {score}/10 | **Reason:** {reason}",
+    ]
+    if paper.get("scoring_failed"):
+        lines.append(f"**Score:** No score | **Reason:** {reason}")
+    else:
+        lines.append(f"**Score:** {score}/10 | **Reason:** {reason}")
+        adjustment = paper.get("score_adjustment", 0)
+        if adjustment:
+            lines.append(f"**Adjustment:** {adjustment:+.1f}")
+    lines += [
         f"**Authors:** {authors_str}",
         f"**Categories:** {', '.join(paper['categories'])}",
         f"**Link:** [{paper['id']}]({arxiv_url})",

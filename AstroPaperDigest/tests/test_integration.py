@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import arxiv
+import requests
 
 from src.profile import build_profile, profile_to_prompt_text
 from src.fetch_arxiv import fetch_papers
@@ -33,6 +34,12 @@ def _fetch_or_skip(categories: list, max_results: int):
             print("  SKIPPED (arXiv API rate limit; test needs the live API)")
             return "skip"
         raise
+    except requests.exceptions.Timeout:
+        print("  SKIPPED (arXiv API timed out; test needs the live API)")
+        return "skip"
+    except requests.exceptions.ConnectionError:
+        print("  SKIPPED (arXiv API unreachable; test needs the live API)")
+        return "skip"
 
 
 def test_escape_bibtex():
@@ -143,7 +150,7 @@ def test_ranker_with_mock():
     llm_config = {
         "base_url": "https://api.deepseek.com",
         "api_key_env": "DEEPSEEK_API_KEY",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
     }
     
     with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}):
@@ -189,7 +196,7 @@ def test_ranker_none_response():
     llm_config = {
         "base_url": "https://api.deepseek.com",
         "api_key_env": "DEEPSEEK_API_KEY",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
     }
     
     with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}):
@@ -197,8 +204,9 @@ def test_ranker_none_response():
             ranked = rank_papers(papers, profile, llm_config)
     
     assert len(ranked) == 1
-    assert ranked[0]["score"] == 5, f"Default score should be 5, got {ranked[0]['score']}"
-    assert "Empty LLM response" in ranked[0]["reason"]
+    assert ranked[0]["scoring_failed"] is True, "Paper should be marked as scoring-failed"
+    assert ranked[0]["score"] == 0, f"Failed paper should score 0, got {ranked[0]['score']}"
+    assert "no score" in ranked[0]["reason"].lower()
     
     print("  PASSED (handled None response gracefully)")
 
@@ -225,7 +233,7 @@ def test_ranker_markdown_wrapped_json():
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = mock_completion
     
-    llm_config = {"base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "model": "deepseek-chat"}
+    llm_config = {"base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "model": "deepseek-v4-flash"}
     
     with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}):
         with patch("src.ranker.get_client", return_value=mock_client):
@@ -259,7 +267,7 @@ def test_ranker_string_score():
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = mock_completion
     
-    llm_config = {"base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "model": "deepseek-chat"}
+    llm_config = {"base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "model": "deepseek-v4-flash"}
     
     with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}):
         with patch("src.ranker.get_client", return_value=mock_client):
