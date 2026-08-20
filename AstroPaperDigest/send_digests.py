@@ -16,7 +16,8 @@ import os
 import sys
 from pathlib import Path
 
-_PROJECT_DIR = Path(__file__).resolve().parent
+from src import paths as _paths
+_PROJECT_DIR = _paths.data_dir()
 os.chdir(_PROJECT_DIR)
 sys.path.insert(0, str(_PROJECT_DIR))
 

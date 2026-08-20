@@ -53,7 +53,9 @@ _MIN_REQUEST_INTERVAL = 3.1
 _PAGE_SIZE = 300
 # arXiv throttles large id_list requests; keep each API call small.
 _ID_LIST_BATCH_SIZE = 50
-_PROJECT_DIR = Path(__file__).resolve().parent.parent
+from src import paths as _paths
+_PROJECT_DIR = _paths.data_dir()
+(_PROJECT_DIR / "output").mkdir(parents=True, exist_ok=True)
 _RATE_LIMIT_FILE = _PROJECT_DIR / "output" / ".arxiv_api_rate_limit"
 _API_THREAD_LOCK = Lock()
 _RECENT_LIST_URL = "https://arxiv.org/list/astro-ph/recent?skip=0&show=2000"

@@ -19,7 +19,8 @@ from .preference_learning import (
 )
 from .progress import emit
 
-FEEDBACK_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "feedback.json")
+from src import paths as _paths
+FEEDBACK_FILE = str(_paths.data_dir() / "feedback.json")
 
 # --- Ranking tunables -------------------------------------------------------
 BATCH_SIZE = 40          # papers per LLM request (context- and response-safe)

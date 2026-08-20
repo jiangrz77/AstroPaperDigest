@@ -17,9 +17,10 @@ import os
 import re
 from datetime import datetime, timezone
 
-_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from src import paths as _paths
+_PROJECT_DIR = _paths.data_dir()
 
-FEEDBACK_FILE = os.path.join(_PROJECT_DIR, "feedback.json")
+FEEDBACK_FILE = os.path.join(str(_PROJECT_DIR), "feedback.json")
 LEARNED_PROFILE_FILE = os.path.join(_PROJECT_DIR, "learned_profile.json")
 
 # --- Tuning constants -------------------------------------------------------

@@ -27,8 +27,12 @@ from werkzeug.utils import secure_filename
 
 import webview
 
-# Ensure working directory is the project root (for .app launches)
-_PROJECT_DIR = Path(__file__).resolve().parent.parent
+# Ensure working directory is the data dir (repo root in source mode,
+# ~/Library/Application Support/AstroPaperDigest in the frozen .app).
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src import paths as _paths
+_PROJECT_DIR = _paths.data_dir()
 os.chdir(_PROJECT_DIR)
 sys.path.insert(0, str(_PROJECT_DIR))
 
@@ -673,7 +677,10 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
 
     try:
         # Build command with preferences
-        cmd = [sys.executable, "-u", "main.py"]
+        if getattr(sys, "frozen", False):
+            cmd = [str(Path(sys._MEIPASS) / "apd-cli")]
+        else:
+            cmd = [sys.executable, "-u", "main.py"]
         if not include_cross:
             cmd.append("--no-cross")
         if not include_replacements:
@@ -2760,8 +2767,12 @@ def update_apply():
     log_path = updater.UPDATES_DIR / "apply.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(log_path, "a", encoding="utf-8")
+    if getattr(sys, "frozen", False):
+        updater_cmd = [str(Path(sys._MEIPASS) / "apd-cli"), "--apply", str(marker_path)]
+    else:
+        updater_cmd = [sys.executable, "-u", "src/updater.py", "--apply", str(marker_path)]
     subprocess.Popen(
-        [sys.executable, "-u", "src/updater.py", "--apply", str(marker_path)],
+        updater_cmd,
         cwd=str(_PROJECT_DIR),
         stdout=log_fh,
         stderr=subprocess.STDOUT,

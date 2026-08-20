@@ -17,7 +17,8 @@ from dotenv import load_dotenv
 
 # Load .env file if present (for API keys, email password)
 # Use absolute path based on script location to work regardless of cwd
-_PROJECT_DIR = Path(__file__).resolve().parent
+from src import paths as _paths
+_PROJECT_DIR = _paths.data_dir()
 load_dotenv(_PROJECT_DIR / ".env")
 os.chdir(_PROJECT_DIR)
 

@@ -25,7 +25,8 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-_PROJECT_DIR = Path(__file__).resolve().parent.parent
+from src import paths as _paths
+_PROJECT_DIR = _paths.data_dir()
 VERSION_FILE = _PROJECT_DIR / "version.txt"
 UPDATES_DIR = _PROJECT_DIR / "output" / "updates"
 BACKUPS_DIR = _PROJECT_DIR / "backups"
