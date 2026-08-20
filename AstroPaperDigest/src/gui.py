@@ -1705,6 +1705,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .toolbar button{height:36px;padding:0 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;display:inline-flex;align-items:center;justify-content:center;line-height:1;box-sizing:border-box}
 .btn-refresh{background:#3498db;color:#fff}.btn-refresh:hover{background:#2980b9}
 .btn-nav{background:#ecf0f1;color:#555}.btn-nav:hover{background:#dfe6e9}
+.paper-total{display:inline-flex;align-items:center;height:32px;padding:0 10px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;color:#64748b;font-size:12px;font-weight:600;white-space:nowrap}
 .date-display{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;font-size:16px;font-weight:600;color:#fff;cursor:default;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);line-height:1}
 .date-arrow{display:inline-flex;align-items:center;justify-content:center;height:34px;width:34px;padding:0;box-sizing:border-box;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;cursor:default;font-size:15px;line-height:1;opacity:.5}
 .btn-today{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;line-height:1}
@@ -1746,10 +1747,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 <div class="toolbar">
   <button class="btn-refresh" disabled style="opacity:.6" title="Running...">&#x21bb;</button>
-  <button class="btn-nav" style="opacity:.5">Strongly Recommended (...)</button>
-  <button class="btn-nav" style="opacity:.5">Highly Relevant (...)</button>
-  <button class="btn-nav" style="opacity:.5">Possibly Relevant (...)</button>
-  <button class="btn-nav" style="opacity:.5">Marginal (...)</button>
+  <button class="btn-nav" style="opacity:.5" aria-label="Five-star papers">★★★★★ (...)</button>
+  <button class="btn-nav" style="opacity:.5" aria-label="Four-star papers">★★★★ (...)</button>
+  <button class="btn-nav" style="opacity:.5" aria-label="Two- to three-star papers">★★★/★★ (...)</button>
 </div>
 </div>
 <div class="loading-area">
@@ -1979,6 +1979,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .btn-refresh{background:#3498db;color:#fff}.btn-refresh:hover{background:#2980b9}
 .btn-nav{background:#ecf0f1;color:#555}.btn-nav:hover{background:#dfe6e9}
 .btn-nav-active{background:#2c3e50;color:#fff}
+.paper-total{display:inline-flex;align-items:center;height:32px;padding:0 10px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;color:#64748b;font-size:12px;font-weight:600;white-space:nowrap}
 .scope-banner{display:none;align-items:center;gap:12px;padding:7px 32px;background:#eff6ff;border-bottom:1px solid #bfdbfe;color:#1e3a5f;font-size:12px;line-height:1.4}
 .scope-banner-text{min-width:0;flex:1}
 .scope-banner-actions{display:flex;align-items:center;gap:10px;white-space:nowrap;margin-left:auto;color:#476581}
@@ -2067,9 +2068,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 <div class="toolbar">
   <button class="btn-refresh" onclick="rerunWithPrefs()" title="Re-run pipeline" style="font-size:18px">&#x21bb;</button>
-  <span class="stats" style="font-size:13px;color:#666">Total: {{ digest.total_papers }} papers &nbsp;|&nbsp; Highly relevant (4–5★): {{ digest.highly_relevant_count }}</span>
+  <span class="paper-total stats" aria-label="Displayed paper count">{{ digest.total_papers }} papers</span>
   {% for tier in digest.tiers %}
-  <button class="btn-nav" data-tier-key="{% if 'Strongly' in tier.name %}strong{% elif 'Highly' in tier.name %}high{% elif 'Possibly' in tier.name %}medium{% else %}low{% endif %}" data-tier-idx="{{ loop.index0 }}" onclick="document.getElementById('tier-{{ loop.index }}').scrollIntoView({behavior:'smooth'})">{{ tier.name }} (<span class="btn-tier-count">{{ tier.papers|length }}</span>)</button>
+  {% if 'Strongly' in tier.name or 'Highly' in tier.name or 'Possibly' in tier.name %}<button class="btn-nav" aria-label="{{ tier.name }}" data-tier-key="{% if 'Strongly' in tier.name %}strong{% elif 'Highly' in tier.name %}high{% else %}medium{% endif %}" data-tier-idx="{{ loop.index0 }}" onclick="document.getElementById('tier-{{ loop.index }}').scrollIntoView({behavior:'smooth'})">{% if 'Strongly' in tier.name %}★★★★★{% elif 'Highly' in tier.name %}★★★★{% else %}★★★/★★{% endif %} (<span class="btn-tier-count">{{ tier.papers|length }}</span>)</button>{% endif %}
   {% endfor %}
   <div class="filter-menu" id="filter-menu">
     <button class="btn-filter" type="button" id="filter-trigger" aria-expanded="false" aria-controls="filter-popover">
@@ -2407,7 +2408,7 @@ function refreshVisibleCounts() {
     const highIndex = Array.prototype.indexOf.call(tierHeaders, highTier);
     const visibleStrong = strongTier ? countVisibleBetween(strongTier, tierHeaders[strongIndex + 1] || null) : 0;
     const visibleHigh = highTier ? countVisibleBetween(highTier, tierHeaders[highIndex + 1] || null) : 0;
-    statsEl.innerHTML = `Total: ${totalVisible} papers &nbsp;|&nbsp; Highly relevant (4–5★): ${visibleStrong + visibleHigh}`;
+    statsEl.textContent = totalVisible + ' papers';
   }
 }
 </script>
