@@ -31,13 +31,17 @@ jobs:
 
       - name: Generate release notes with SHA-256 checksums
         run: |
-          TAG="$(git describe --tags --abbrev=0)"
-          git tag -l --format='%(contents)' "$TAG" > /tmp/release-body.md
+          # Read the annotated tag message via the GitHub API (robust on any
+          # runner; git tag -l %(contents) behaved differently in CI).
+          if REF_SHA="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.sha' 2>/dev/null)"; then
+            gh api "repos/$GITHUB_REPOSITORY/git/tags/$REF_SHA" --jq '.message' > /tmp/release-body.md
+          else
+            # lightweight tag or API hiccup: fall back to the tag name
+            echo "$GITHUB_REF_NAME" > /tmp/release-body.md
+          fi
           {
             echo ""
             echo "## Checksums (SHA-256)"
-            # .app.zip FIRST: the in-app updater verifies against the first
-            # SHA-256 it finds in the release body.
             for f in AstroPaperDigest/dist/AstroPaperDigest-*.dmg; do
               echo "- $(basename "$f")"
               echo "  SHA256: $(shasum -a 256 "$f" | awk '{print $1}')"
