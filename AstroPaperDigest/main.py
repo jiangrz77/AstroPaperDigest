@@ -9,7 +9,6 @@ import argparse
 import os
 import sys
 from datetime import date, datetime, time as time_cls
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import yaml

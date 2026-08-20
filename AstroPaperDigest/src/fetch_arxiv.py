@@ -37,7 +37,6 @@ import time
 from contextlib import contextmanager
 from datetime import date as date_cls
 from datetime import datetime, time as time_cls, timedelta, timezone
-from pathlib import Path
 from threading import Lock
 from typing import Optional
 from urllib.request import Request, urlopen
@@ -236,9 +235,14 @@ def _fetch_recent_listing() -> Optional[dict[date_cls, list[str]]]:
         except Exception:
             # The system proxy may be unreachable; retry with a direct
             # connection before giving up on the official listing.
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(request, timeout=30) as response:
-                content = response.read().decode("utf-8")
+            try:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(request, timeout=30) as response:
+                    content = response.read().decode("utf-8")
+            except Exception:
+                # Both paths failed; return None so callers fall back to the
+                # API query instead of crashing the whole run.
+                return None
     return _parse_recent_listing_sections(content)
 
 

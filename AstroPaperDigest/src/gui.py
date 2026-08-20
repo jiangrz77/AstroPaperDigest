@@ -2551,7 +2551,7 @@ def post_preferences():
         prefs["last_viewed_date"] = data["last_viewed_date"]
     if isinstance(data.get("auto_check_updates"), bool):
         prefs["auto_check_updates"] = data["auto_check_updates"]
-    if "dismissed_update_version" in data:
+    if data.get("dismissed_update_version"):
         prefs["dismissed_update_version"] = str(data["dismissed_update_version"])
     save_preferences(prefs)
     return jsonify({"ok": True, "preferences": prefs})
@@ -2742,7 +2742,6 @@ def update_download():
 @app.route("/update/apply", methods=["POST"])
 def update_apply():
     """Confirm install: write marker, spawn detached updater, restart."""
-    global _update_state
     if _pipeline_status == "running":
         return jsonify({"ok": False, "error": "The paper pipeline is running. Please wait for it to finish before updating."}), 409
     with _update_lock:
@@ -2819,7 +2818,7 @@ def _run_desktop(server):
 
 
 def main():
-    global _current_digest, _pipeline_message, _pipeline_status, _server
+    global _current_digest, _pipeline_message, _pipeline_status
 
     parser = argparse.ArgumentParser(description="AstroPaperDigest desktop app")
     parser.add_argument(
