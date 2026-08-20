@@ -1,5 +1,6 @@
 """Generate BibTeX and Markdown outputs from ranked papers."""
 
+import json
 import os
 import re
 from datetime import date
@@ -234,8 +235,30 @@ def write_digest(
     
     content = generate_markdown_digest(papers, threshold, digest_date=d)
     
-    with open(digest_path, "w", encoding="utf-8") as f:
+    # Commit the digest atomically.  If generation is stopped while output is
+    # being written, users keep the previous complete digest rather than a
+    # truncated replacement.
+    temp_digest_path = digest_path + ".tmp"
+    with open(temp_digest_path, "w", encoding="utf-8") as f:
         f.write(content)
+    os.replace(temp_digest_path, digest_path)
+
+    # Sidecar with full abstracts so the desktop digest page can expand them
+    # ("Show more" / "Show less") without bloating the emailed markdown, which
+    # intentionally keeps the 300-char snippets above.
+    full_abstracts = {}
+    for p in papers:
+        pid = p.get("id")
+        abstract = (p.get("abstract") or "").strip()
+        if pid and abstract:
+            full_abstracts[pid] = abstract
+    if full_abstracts:
+        sidecar_path = os.path.join(digest_dir, f"digest_{d}.full.json")
+        temp_sidecar_path = sidecar_path + ".tmp"
+        with open(temp_sidecar_path, "w", encoding="utf-8") as f:
+            json.dump(full_abstracts, f, ensure_ascii=False, indent=2)
+        os.replace(temp_sidecar_path, sidecar_path)
+        print(f"  Full abstracts written to {sidecar_path}")
     
     print(f"  Digest written to {digest_path}")
     return digest_path

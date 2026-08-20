@@ -11,9 +11,11 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from collections import deque
 from datetime import date, datetime
@@ -43,18 +45,31 @@ from src.preference_learning import (
     rebuild_learned_profile,
     reset_learned_profile,
 )
+from src.feedback_state import apply_to_digest, clear_date, get_adjustment, record_adjustment
 from src.progress import parse as parse_progress
 
 FEEDBACK_FILE = os.path.join(_PROJECT_DIR, "feedback.json")
 PREFERENCES_FILE = os.path.join(_PROJECT_DIR, "preferences.json")
 
-app = Flask(__name__)
+# Static assets are read from the source tree during development and from the
+# PyInstaller bundle in the installed app. User data remains in _PROJECT_DIR.
+if getattr(sys, "frozen", False):
+    _STATIC_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "static"
+else:
+    _STATIC_DIR = _PROJECT_DIR / "static"
+
+app = Flask(
+    __name__,
+    static_folder=str(_STATIC_DIR),
+    static_url_path="/static",
+)
 
 # Global state
 _current_digest = None
-_pipeline_status = "idle"  # idle | running | done | error
+_pipeline_status = "idle"  # idle | running | done | cancelled | error
 _pipeline_message = ""
 _pipeline_process = None
+_pipeline_cancel_requested = False
 _pipeline_started_at = None
 _pipeline_progress = {"stage": "", "done": 0, "total": 0, "message": ""}
 _pipeline_log = deque(maxlen=60)
@@ -80,8 +95,8 @@ _DEFAULT_ARXIV_CATEGORIES = (
 )
 _BATCH_SUMMARY_RE = re.compile(
     r"Official astro-ph batch: (?P<official>\d+) papers\. "
-    r"Selected categories \((?P<categories>.+)\): "
-    r"(?P<selected>\d+) papers will be processed\."
+    r"All (?P<selected>\d+) papers will be scored\. Default display "
+    r"categories: (?P<categories>.+)\."
 )
 
 # --- Update check state ---
@@ -209,12 +224,13 @@ def _apply_interests(config: dict, request) -> None:
     """Update paper categories and the selected research-profile source."""
     profile_mode = request.form.get("profile_mode", "quick")
     categories = request.form.getlist("categories")
-    if categories:
-        config["arxiv_categories"] = categories
+    # These categories set the default display filter in the digest.  They no
+    # longer limit what is fetched or scored.
+    config["arxiv_categories"] = categories
     if profile_mode == "quick":
+        config.pop("bib_file", None)
         keywords_raw = request.form.get("keywords", "").strip()
-        if keywords_raw:
-            config["keywords"] = [k.strip() for k in keywords_raw.split(",") if k.strip()]
+        config["keywords"] = [k.strip() for k in keywords_raw.split(",") if k.strip()]
     else:
         bib_file = request.files.get("bib_file")
         bib_path = request.form.get("bib_path", "").strip()
@@ -580,6 +596,7 @@ _STAGE_LABELS = {
     "rank": "AI ranking",
     "output": "Generating output",
     "done": "Done",
+    "cancelled": "Cancelled",
     "error": "Error",
 }
 
@@ -611,7 +628,7 @@ def _pipeline_progress_message(line: str) -> str:
     return ""
 
 
-def _stream_pipeline(cmd: list[str], timeout: int = 900) -> tuple[int, str]:
+def _stream_pipeline(cmd: list[str], timeout: int = 900) -> tuple[int, str, str]:
     """Run the CLI while streaming progress instead of buffering silently."""
     global _pipeline_message, _pipeline_process
 
@@ -619,6 +636,10 @@ def _stream_pipeline(cmd: list[str], timeout: int = 900) -> tuple[int, str]:
     output_queue = Queue()
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
+    staging_parent = _PROJECT_DIR / "output"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = tempfile.mkdtemp(prefix="apd-run-", dir=str(staging_parent))
+    environment["APD_OUTPUT_STAGING_DIR"] = staging_dir
     _pipeline_process = subprocess.Popen(
         cmd,
         cwd=str(_PROJECT_DIR),
@@ -628,6 +649,10 @@ def _stream_pipeline(cmd: list[str], timeout: int = 900) -> tuple[int, str]:
         bufsize=1,
         env=environment,
     )
+    # A user can press Stop during the brief interval between launching the
+    # worker thread and creating its child process.
+    if _pipeline_cancel_requested:
+        _pipeline_process.terminate()
 
     def read_output():
         assert _pipeline_process.stdout is not None
@@ -675,15 +700,35 @@ def _stream_pipeline(cmd: list[str], timeout: int = 900) -> tuple[int, str]:
                 if progress:
                     _pipeline_message = progress
 
-        return _pipeline_process.wait(), "".join(output_lines)
+        return _pipeline_process.wait(), "".join(output_lines), staging_dir
     finally:
         _pipeline_process = None
+
+
+def _commit_staged_outputs(staging_dir: str) -> None:
+    """Atomically publish a completed run's staged Digest and BibTeX files."""
+    cfg, _ = _load_config_and_env()
+    output_cfg = cfg.get("output", {}) or {}
+    destinations = {
+        "digests": Path(output_cfg.get("digest_dir", "./output/digests")),
+        "bibtex": Path(output_cfg.get("bibtex_dir", "./output/bibtex")),
+    }
+    root = Path(staging_dir)
+    for kind, destination in destinations.items():
+        source_dir = root / kind
+        if not source_dir.exists():
+            continue
+        destination.mkdir(parents=True, exist_ok=True)
+        for source in source_dir.iterdir():
+            if source.is_file() and not source.name.endswith(".tmp"):
+                os.replace(source, destination / source.name)
 
 
 def run_pipeline(include_cross: bool = True, include_replacements: bool = True, target_date: str = ""):
     """Run the recommendation pipeline in a background thread."""
     global _current_digest, _pipeline_status, _pipeline_message
     global _pipeline_started_at, _pipeline_progress, _pipeline_batch_summary
+    global _pipeline_cancel_requested
     _pipeline_status = "running"
     _pipeline_started_at = time.time()
     _pipeline_log.clear()
@@ -709,7 +754,7 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
         if target_date:
             cmd.extend(["--target-date", target_date])
         
-        return_code, stdout = _stream_pipeline(cmd)
+        return_code, stdout, staging_dir = _stream_pipeline(cmd)
         summary_match = _BATCH_SUMMARY_RE.search(stdout)
         if summary_match:
             _pipeline_batch_summary = {
@@ -717,7 +762,13 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
                 "selected_total": int(summary_match.group("selected")),
                 "categories": summary_match.group("categories"),
             }
-        if return_code == 0:
+        if _pipeline_cancel_requested:
+            _pipeline_status = "cancelled"
+            _pipeline_progress.update({"stage": "cancelled"})
+            _pipeline_message = "Generation stopped. No new digest was saved."
+        elif return_code == 0:
+            _commit_staged_outputs(staging_dir)
+            clear_date(target_date or _digest_today_str())
             # Locate the digest actually written by this run. Prefer the file
             # for the requested date, then the latest file, then the path the
             # CLI printed (covers custom digest_dir settings).
@@ -794,6 +845,9 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
         _pipeline_status = "error"
         _pipeline_progress.update({"stage": "error"})
         _pipeline_message = str(e)
+    finally:
+        if "staging_dir" in locals():
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def _start_pipeline(
@@ -802,12 +856,13 @@ def _start_pipeline(
     target_date: str = "",
 ) -> bool:
     """Start at most one pipeline process."""
-    global _pipeline_status, _pipeline_message, _pipeline_batch_summary
+    global _pipeline_status, _pipeline_message, _pipeline_batch_summary, _pipeline_cancel_requested
 
     with _pipeline_lock:
         if _pipeline_status == "running":
             return False
         _pipeline_status = "running"
+        _pipeline_cancel_requested = False
         _pipeline_message = "[1/5] Starting pipeline..."
         _pipeline_batch_summary = None
         Thread(
@@ -1051,7 +1106,7 @@ textarea{height:80px;resize:vertical}
   <div class="step">
     <h2><span class="step-num">2</span>Research Interests</h2>
     <h3 style="font-size:14px;color:#2c3e50;margin-bottom:4px">Paper Categories</h3>
-    <p class="hint">Choose which arXiv categories are included in every daily digest.</p>
+    <p class="hint">All official astro-ph papers are included and scored in every daily digest. These choices set the categories shown by default in the Digest view.</p>
     <div class="checkbox-grid">
       <label><input type="checkbox" name="categories" value="astro-ph.GA" {% if 'astro-ph.GA' in cur_categories %}checked{% endif %}> astro-ph.GA</label>
       <label><input type="checkbox" name="categories" value="astro-ph.SR" {% if 'astro-ph.SR' in cur_categories %}checked{% endif %}> astro-ph.SR</label>
@@ -1122,6 +1177,7 @@ function updateProvider() {
   if (p === 'deepseek') { model.value = 'deepseek-v4-flash'; urlGroup.style.display = 'none'; }
   else if (p === 'openai') { model.value = 'gpt-4o-mini'; urlGroup.style.display = 'none'; }
   else { model.value = ''; urlGroup.style.display = 'block'; baseUrl.focus(); }
+  if (window.markSettingsDirty) window.markSettingsDirty();
 }
 function toggleProfileMode() {
   const mode = document.querySelector('input[name="profile_mode"]:checked').value;
@@ -1206,6 +1262,9 @@ textarea{height:90px;resize:vertical}
 .lp-btn:hover{border-color:#999}
 .lp-btn.danger{color:#dc2626;border-color:#fecaca}
 .lp-btn.danger:hover{background:#fef2f2}
+.save-bar{position:sticky;bottom:16px;z-index:5;display:flex;align-items:center;justify-content:flex-end;gap:10px;padding:12px 16px;background:rgba(255,255,255,.96);border:1px solid #bfdbfe;border-radius:10px;box-shadow:0 8px 24px rgba(15,23,42,.14)}
+.save-bar[hidden]{display:none}.save-note{margin-right:auto;font-size:13px;color:#475569}.btn-secondary{background:#fff;color:#334155;border:1px solid #cbd5e1}.btn-secondary:hover{background:#f8fafc}
+.saved-notice{margin-bottom:16px;background:#ecfdf5;border:1px solid #a7f3d0;color:#047857;border-radius:8px;padding:10px 12px;font-size:13px}
 </style>
 </head>
 <body>
@@ -1224,22 +1283,21 @@ textarea{height:90px;resize:vertical}
     </div>
   </nav>
   <main class="content">
+    <form id="settings-form" method="POST" action="/settings/save" enctype="multipart/form-data">
+    {% if saved %}<div class="saved-notice">Saved. Changes apply to your next digest.</div>{% endif %}
 
     <section class="panel active" id="panel-general">
       <div class="card">
         <h2>General</h2>
         <p class="sub">Digest preferences and application updates.</p>
         <label class="check-line" style="margin-top:0">
-          <input type="checkbox" id="pref-cross" {% if prefs.include_cross %}checked{% endif %}>
+          <input type="checkbox" id="pref-cross" name="include_cross" {% if prefs.include_cross %}checked{% endif %}>
           Include cross-listed papers
         </label>
         <label class="check-line">
-          <input type="checkbox" id="pref-repl" {% if prefs.include_replacements %}checked{% endif %}>
+          <input type="checkbox" id="pref-repl" name="include_replacements" {% if prefs.include_replacements %}checked{% endif %}>
           Include replacement (updated) papers
         </label>
-        <div class="row">
-          <button class="btn btn-primary" type="button" id="btn-save-general" onclick="saveGeneral()">Save Changes</button>
-        </div>
       </div>
 
       <div class="card" id="update">
@@ -1254,7 +1312,7 @@ textarea{height:90px;resize:vertical}
           <button class="btn btn-success" type="button" id="btn-apply-update" style="display:none">Install &amp; Restart</button>
         </div>
         <label class="check-line" style="margin-top:16px">
-          <input type="checkbox" id="auto-check-updates" {% if prefs.auto_check_updates %}checked{% endif %}>
+          <input type="checkbox" id="auto-check-updates" name="auto_check_updates" {% if prefs.auto_check_updates %}checked{% endif %}>
           Check for updates on startup
         </label>
       </div>
@@ -1268,7 +1326,6 @@ textarea{height:90px;resize:vertical}
       <div class="card">
         <h2>LLM &amp; API</h2>
         <p class="sub">Configure the LLM provider used to score paper relevance.</p>
-        <form method="POST" action="/settings/save?section=llm">
           <label for="provider">Provider</label>
           <select id="provider" name="provider" onchange="updateProvider()">
             <option value="deepseek" {% if cur_provider == 'deepseek' %}selected{% endif %}>DeepSeek</option>
@@ -1283,18 +1340,13 @@ textarea{height:90px;resize:vertical}
             <label for="base_url">Base URL</label>
             <input type="text" id="base_url" name="base_url" placeholder="https://api.example.com/v1" value="{{ cur_base_url or '' }}">
           </div>
-          <div class="row">
-            <button class="btn btn-primary" type="submit">Save Changes</button>
-          </div>
-        </form>
       </div>
     </section>
 
     <section class="panel" id="panel-interests">
-      <form method="POST" action="/settings/save?section=interests" enctype="multipart/form-data">
         <div class="card">
           <h2>Paper Categories</h2>
-          <p class="sub">Choose which arXiv categories are included in every daily digest.</p>
+          <p class="sub">All official astro-ph papers are included and scored in every daily digest. These choices set the categories shown by default in the Digest view.</p>
           <div class="checkbox-grid">
             <label><input type="checkbox" name="categories" value="astro-ph.GA" {% if 'astro-ph.GA' in cur_categories %}checked{% endif %}> astro-ph.GA</label>
             <label><input type="checkbox" name="categories" value="astro-ph.SR" {% if 'astro-ph.SR' in cur_categories %}checked{% endif %}> astro-ph.SR</label>
@@ -1323,11 +1375,7 @@ textarea{height:90px;resize:vertical}
             <input type="text" id="bib_path" name="bib_path" placeholder="/path/to/your/collection.bib" value="{{ cur_bib_file or '' }}">
             <p class="hint">Your research profile is extracted automatically from the bibliography.</p>
           </div>
-          <div class="row">
-            <button class="btn btn-primary" type="submit">Save Changes</button>
-          </div>
         </div>
-      </form>
       <div class="card" id="learned-preferences">
         <h2>Learned Preferences</h2>
         <p class="sub">Learned from your Overrated / Underrated feedback; you can also adjust manually. Weight &gt; 1 = more relevant, &lt; 1 = less relevant, 1 = no effect.</p>
@@ -1350,6 +1398,12 @@ textarea{height:90px;resize:vertical}
       </div>
     </section>
 
+      <div class="save-bar" id="save-bar" hidden>
+        <span class="save-note">Unsaved changes</span>
+        <button class="btn btn-secondary" type="button" id="discard-settings">Discard</button>
+        <button class="btn btn-primary" type="submit">Save Changes</button>
+      </div>
+    </form>
   </main>
 </div>
 <script>
@@ -1402,24 +1456,32 @@ function toggleProfileMode() {
 </script>
 <script>
 (function () {
-  function saveGeneral() {
-    const cross = document.getElementById("pref-cross").checked;
-    const repl = document.getElementById("pref-repl").checked;
-    const auto = document.getElementById("auto-check-updates").checked;
-    fetch("/preferences", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({include_cross: cross, include_replacements: repl, auto_check_updates: auto})
-    }).then(function (r) { return r.json(); }).then(function (d) {
-      const btn = document.getElementById("btn-save-general");
-      if (btn) {
-        const old = btn.textContent;
-        btn.textContent = d.ok ? "Saved" : "Failed";
-        setTimeout(function () { btn.textContent = old; }, 1500);
-      }
-    }).catch(function () {});
+  const form = document.getElementById('settings-form');
+  const bar = document.getElementById('save-bar');
+  const discard = document.getElementById('discard-settings');
+  let dirty = false;
+  function setDirty(value) {
+    dirty = value;
+    if (bar) bar.hidden = !dirty;
   }
-  window.saveGeneral = saveGeneral;
+  window.markSettingsDirty = function () { setDirty(true); };
+  if (form) {
+    form.addEventListener('input', function () { setDirty(true); });
+    form.addEventListener('change', function () { setDirty(true); });
+    form.addEventListener('submit', function () { setDirty(false); });
+  }
+  if (discard) discard.addEventListener('click', function () { window.location.reload(); });
+  window.addEventListener('beforeunload', function (event) {
+    if (!dirty) return;
+    event.preventDefault();
+    event.returnValue = '';
+  });
+  document.querySelectorAll('.back-link').forEach(function (link) {
+    link.addEventListener('click', function (event) {
+      if (!dirty || confirm('Discard unsaved changes?')) return;
+      event.preventDefault();
+    });
+  });
 })();
 </script>
 <script>
@@ -1661,6 +1723,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .log-line-error{color:#fca5a5;font-weight:600}
 .btn{margin-top:20px;padding:10px 24px;background:#3498db;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer}
 .btn:hover{background:#2980b9}
+.btn-stop{background:#dc2626}.btn-stop:hover{background:#b91c1c}.btn-stop:disabled{opacity:.55;cursor:default}
 </style>
 </head>
 <body>
@@ -1697,7 +1760,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   <div class="error" id="error" style="display:none"></div>
   <div class="log-toggle" id="log-toggle" onclick="toggleLog()">▸ View run log</div>
   <div class="log-box" id="log-box"><div id="log-content"></div></div>
-  <button class="btn" id="retry" style="display:none" onclick="location.href='/run?date={{ display_date }}'">Retry</button>
+  <button class="btn btn-stop" id="stop" onclick="stopGeneration()">Stop generation</button>
+  <button class="btn" id="retry" style="display:none" onclick="retryRun()">Run again</button>
   <button class="btn" id="back" style="display:none;margin-left:10px;background:#7f8c8d" onclick="location.href='/digest/{{ display_date }}'">Back to Digest</button>
 </div>
 <script>
@@ -1764,6 +1828,7 @@ function renderStatus(d) {
   const errEl = document.getElementById('error');
   const retryEl = document.getElementById('retry');
   const backEl = document.getElementById('back');
+  const stopEl = document.getElementById('stop');
   const logToggle = document.getElementById('log-toggle');
   const logBox = document.getElementById('log-box');
   const logContent = document.getElementById('log-content');
@@ -1780,8 +1845,18 @@ function renderStatus(d) {
     errEl.textContent = d.message || 'Pipeline failed.';
     retryEl.style.display = 'inline-block';
     backEl.style.display = 'inline-block';
+    stopEl.style.display = 'none';
+  } else if (d.status === 'cancelled') {
+    bar.classList.add('error');
+    pctEl.textContent = 'Cancelled';
+    errEl.style.display = 'block';
+    errEl.textContent = d.message || 'Generation stopped.';
+    retryEl.style.display = 'inline-block';
+    backEl.style.display = 'inline-block';
+    stopEl.style.display = 'none';
   } else if (d.status === 'done') {
     bar.style.width = '100%';
+    stopEl.style.display = 'none';
     pctEl.textContent = '100%';
   } else {
     if (d.total > 0) {
@@ -1823,6 +1898,24 @@ function renderStatus(d) {
   }
 }
 
+function retryRun() {
+  if (!confirm('Run the pipeline again for this date? This may consume LLM API credits.')) return;
+  window.location.href = '/run?date={{ display_date }}';
+}
+function stopGeneration() {
+  if (!confirm('Stop generating this digest? The current run will stop and no new digest will be saved. Previously saved digests are unchanged.')) return;
+  const button = document.getElementById('stop');
+  button.disabled = true;
+  button.textContent = 'Stopping…';
+  fetch('/run/cancel', {method: 'POST'}).then(function (response) {
+    if (!response.ok) throw new Error('Unable to stop generation.');
+  }).catch(function () {
+    button.disabled = false;
+    button.textContent = 'Stop generation';
+    alert('Unable to stop generation. Please try again.');
+  });
+}
+
 function toggleLog() {
   const box = document.getElementById('log-box');
   const toggle = document.getElementById('log-toggle');
@@ -1847,7 +1940,7 @@ function poll() {
         const query = params.toString();
         window.location.href = '/digest/{{ display_date }}' + (query ? '?' + query : '');
       }, 900);
-    } else if (d.status === 'error') {
+    } else if (d.status === 'error' || d.status === 'cancelled') {
       // stay on this page; Retry / Back to Digest buttons are shown
     } else {
       setTimeout(poll, 1500);
@@ -1869,6 +1962,8 @@ DIGEST_TEMPLATE = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AstroPaperDigest - {{ digest.date }}</title>
+<script defer src="/static/mathjax/config.js"></script>
+<script defer src="/static/mathjax/tex-svg-full.js" id="MathJax-script"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333}
@@ -1903,6 +1998,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .card-reason{font-size:13px;color:#666;margin-bottom:4px}
 .card-meta{font-size:12px;color:#999;margin-bottom:8px}
 .card-abstract{font-size:13px;color:#555;line-height:1.5;margin-bottom:10px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.card-abstract.expanded{display:block;-webkit-line-clamp:unset}
+.abstract-toggle{display:none;margin:-4px 0 10px;padding:0;border:none;background:none;font:inherit;font-size:12px;color:#7a8699;cursor:pointer;line-height:1.4;user-select:none}
+.abstract-toggle:hover{color:#4a5568}
 .card-actions{display:flex;gap:8px;align-items:center}
 .card-actions a{font-size:12px;color:#3498db;text-decoration:none}
 .card-actions a:hover{text-decoration:underline}
@@ -1913,6 +2011,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .checkbox-group{display:flex;gap:15px;align-items:center;margin-left:auto;font-size:13px}
 .checkbox-group label{display:inline-flex;align-items:center;gap:5px;height:36px;cursor:pointer;color:#555}
 .checkbox-group input[type="checkbox"]{cursor:pointer;width:16px;height:16px}
+.category-group{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;color:#555;margin-left:auto}
+.category-group label{display:inline-flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap}
 .date-display{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;font-size:16px;font-weight:600;color:#fff;cursor:pointer;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);line-height:1;user-select:none}
 .date-display:hover{background:rgba(255,255,255,.2)}
 .date-arrow{display:inline-flex;align-items:center;justify-content:center;height:34px;width:34px;padding:0;box-sizing:border-box;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:15px;line-height:1}
@@ -1944,8 +2044,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   <button class="btn-refresh" onclick="rerunWithPrefs()" title="Re-run pipeline" style="font-size:18px">&#x21bb;</button>
   <span class="stats" style="font-size:13px;color:#666">Total: {{ digest.total_papers }} papers &nbsp;|&nbsp; Highly relevant: {{ digest.highly_relevant_count }}</span>
   {% for tier in digest.tiers %}
-  <button class="btn-nav" data-tier-idx="{{ loop.index0 }}" onclick="document.getElementById('tier-{{ loop.index }}').scrollIntoView({behavior:'smooth'})">{{ tier.name }} (<span class="btn-tier-count">{{ tier.papers|length }}</span>)</button>
+  <button class="btn-nav" data-tier-key="{% if 'Highly' in tier.name %}high{% elif 'Possibly' in tier.name %}medium{% else %}low{% endif %}" data-tier-idx="{{ loop.index0 }}" onclick="document.getElementById('tier-{{ loop.index }}').scrollIntoView({behavior:'smooth'})">{{ tier.name }} (<span class="btn-tier-count">{{ tier.papers|length }}</span>)</button>
   {% endfor %}
+  <div class="category-group" aria-label="Displayed categories">
+    <span>Categories:</span>
+    {% for category in display_categories_all %}
+    <label><input class="digest-category" type="checkbox" value="{{ category }}" {% if category in display_categories %}checked{% endif %}> {{ category.replace('astro-ph.', '') }}</label>
+    {% endfor %}
+  </div>
   <div class="checkbox-group">
     <label><input type="checkbox" id="chk-cross" {% if prefs.include_cross %}checked{% endif %}> Cross-listed</label>
     <label><input type="checkbox" id="chk-repl" {% if prefs.include_replacements %}checked{% endif %}> Replacements</label>
@@ -1961,23 +2067,24 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 <div class="container">
 {% for tier in digest.tiers %}
-  <div class="tier-header {% if 'Highly' in tier.name %}tier-highly{% elif 'Possibly' in tier.name %}tier-possibly{% else %}tier-marginal{% endif %}" id="tier-{{ loop.index }}">
+  <div class="tier-header {% if 'Highly' in tier.name %}tier-highly{% elif 'Possibly' in tier.name %}tier-possibly{% else %}tier-marginal{% endif %}" id="tier-{{ loop.index }}" data-tier="{% if 'Highly' in tier.name %}high{% elif 'Possibly' in tier.name %}medium{% else %}low{% endif %}">
     <h2><span class="tier-name-text">{{ tier.name }}</span> (<span class="tier-count">{{ tier.papers|length }}</span>)</h2>
   </div>
   {% for paper in tier.papers %}
-  <div class="card" id="card-{{ paper.paper_id | replace('.', '-') }}" data-paper-type="{{ paper.paper_type | default('new') }}">
+  <div class="card" id="card-{{ paper.paper_id | replace('.', '-') }}" data-paper-type="{{ paper.paper_type | default('new') }}" data-categories="{{ paper.categories }}" data-base-score="{{ paper.base_score | default(paper.score) }}" data-score="{{ paper.score }}">
     <div class="card-title">
       {% if paper.scoring_failed %}
       <span class="score-badge score-low" style="background:#dc2626">No score</span>
       {% else %}
-      <span class="score-badge {% if paper.score >= 7 %}score-high{% elif paper.score >= 5 %}score-mid{% else %}score-low{% endif %}">{{ paper.score }}/10</span>
+      <span class="score-badge {% if paper.score >= 7 %}score-high{% elif paper.score >= 5 %}score-mid{% else %}score-low{% endif %}" data-role="score">{{ paper.score }}/10</span>
       {% if paper.score_adjustment %}<span class="adj-badge {% if paper.score_adjustment > 0 %}adj-pos{% else %}adj-neg{% endif %}" title="Preference adjustment (relative to LLM raw score)">{{ '%+.1f' | format(paper.score_adjustment) }}</span>{% endif %}
       {% endif %}
       <span>{{ paper.title }}</span>
     </div>
     {% if paper.reason %}<div class="card-reason">{{ paper.reason }}</div>{% endif %}
     <div class="card-meta">{{ paper.authors[:80] }}{% if paper.categories %} &nbsp;|&nbsp; {{ paper.categories }}{% endif %}</div>
-    {% if paper.abstract %}<div class="card-abstract">{{ paper.abstract[:300] }}</div>{% endif %}
+    {% if paper.abstract %}<div class="card-abstract" id="abs-{{ paper.paper_id | replace('.', '-') }}">{{ full_abstracts.get(paper.paper_id, paper.abstract) }}</div>
+    <button class="abstract-toggle" type="button" data-target="abs-{{ paper.paper_id | replace('.', '-') }}">Show more &#9660;</button>{% endif %}
     <div class="card-actions">
       {% if paper.link %}<a href="{{ paper.link }}" target="_blank">arxiv:{{ paper.paper_id }}</a>{% endif %}
       <button class="fb-btn fb-overrated" data-id="{{ paper.paper_id }}" data-title="{{ paper.title[:80] }}" data-score="{{ paper.score }}" onclick="giveFeedback(this,'overrated')">Overrated</button>
@@ -2002,7 +2109,7 @@ function showScopeBanner() {
   const close = document.getElementById('scope-banner-close');
   if (!banner || !text || !countdown || !close) return;
 
-  text.textContent = 'Official astro-ph batch: ' + official + ' papers · Processed for your selected categories: ' + selected + ' papers (' + categories + ')';
+  text.textContent = 'Official astro-ph batch: ' + official + ' papers · All ' + selected + ' papers were scored. Your default Digest display categories: ' + categories;
   banner.style.display = 'flex';
   let remaining = 5;
   let timer = null;
@@ -2031,27 +2138,79 @@ function showScopeBanner() {
   window.history.replaceState(null, '', window.location.pathname + (query ? '?' + query : '') + window.location.hash);
 }
 showScopeBanner();
-function giveFeedback(btn, action) {
-  const id = btn.dataset.id, title = btn.dataset.title, score = btn.dataset.score;
-  const wasActive = btn.classList.contains('active');
-  fetch('/feedback', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({paper_id:id, title:title, action: wasActive ? 'cancel' : action, original_score:parseInt(score), date: DIGEST_DATE})
-  }).then(r=>r.json()).then(d=>{
-    if(d.ok){
-      const parent = btn.parentElement;
-      parent.querySelectorAll('.fb-btn').forEach(b=>b.classList.remove('active'));
-      if(!wasActive) btn.classList.add('active');
-    }
+function applyCategoryDisplay() {
+  const selected = Array.from(document.querySelectorAll('.digest-category:checked')).map(function (input) { return input.value; });
+  document.querySelectorAll('.card[data-categories]').forEach(function (card) {
+    const categories = String(card.dataset.categories || '').split(',').map(function (item) { return item.trim(); });
+    card.style.display = selected.length === 0 || categories.some(function (category) { return selected.indexOf(category) >= 0; }) ? '' : 'none';
+  });
+  document.querySelectorAll('[id^="tier-"]').forEach(function (header) {
+    const cards = [];
+    let node = header.nextElementSibling;
+    while (node && !node.id?.startsWith('tier-')) { if (node.classList.contains('card')) cards.push(node); node = node.nextElementSibling; }
+    const visible = cards.filter(function (card) { return card.style.display !== 'none'; }).length;
+    const count = header.querySelector('.tier-count');
+    if (count) count.textContent = visible;
+    header.style.display = visible ? '' : 'none';
   });
 }
-fetch('/feedback').then(r=>r.json()).then(list=>{
-  list.forEach(fb=>{
-    const btns = document.querySelectorAll(`[data-id="${fb.paper_id}"]`);
-    btns.forEach(b=>{
-      if(b.classList.contains('fb-'+fb.action)) b.classList.add('active');
-    });
+document.querySelectorAll('.digest-category').forEach(function (input) { input.addEventListener('change', applyCategoryDisplay); });
+applyCategoryDisplay();
+function tierKey(score) {
+  return score >= 7 ? 'high' : (score >= 5 ? 'medium' : 'low');
+}
+function updateTierCounts() {
+  document.querySelectorAll('.tier-header').forEach(function (header) {
+    let node = header.nextElementSibling, count = 0;
+    while (node && !node.classList.contains('tier-header')) {
+      if (node.classList.contains('card') && node.style.display !== 'none') count += 1;
+      node = node.nextElementSibling;
+    }
+    const countEl = header.querySelector('.tier-count');
+    if (countEl) countEl.textContent = count;
+    const nav = document.querySelector('.btn-nav[data-tier-key="' + header.dataset.tier + '"] .btn-tier-count');
+    if (nav) nav.textContent = count;
   });
-});
+}
+function moveCardToTier(card, score) {
+  const key = tierKey(score);
+  const header = document.querySelector('.tier-header[data-tier="' + key + '"]');
+  if (!header) return;
+  const container = header.parentElement;
+  let node = header.nextElementSibling;
+  let insertBefore = null;
+  while (node && !node.classList.contains('tier-header')) {
+    if (node.classList.contains('card') && Number(node.dataset.score || 0) < score) {
+      insertBefore = node;
+      break;
+    }
+    node = node.nextElementSibling;
+  }
+  container.insertBefore(card, insertBefore || node);
+  card.dataset.tier = key;
+  updateTierCounts();
+}
+function updateCardScore(card, score) {
+  const badge = card.querySelector('[data-role="score"]');
+  if (!badge) return;
+  badge.textContent = score + '/10';
+  badge.classList.remove('score-high', 'score-mid', 'score-low');
+  badge.classList.add(score >= 7 ? 'score-high' : (score >= 5 ? 'score-mid' : 'score-low'));
+  card.dataset.score = String(score);
+}
+function giveFeedback(btn, action) {
+  const id = btn.dataset.id, title = btn.dataset.title;
+  const card = btn.closest('.card');
+  btn.disabled = true;
+  fetch('/feedback', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({paper_id:id, title:title, action:action, original_score:parseInt(card.dataset.baseScore || '0'), date: DIGEST_DATE})
+  }).then(r=>r.json()).then(d=>{
+    if(d.ok){
+      updateCardScore(card, d.score);
+      moveCardToTier(card, d.score);
+    }
+  }).catch(function () {}).finally(function () { btn.disabled = false; });
+}
 
 function rerunWithPrefs() {
   if (!confirm('Re-run the pipeline for this date? This will regenerate the digest and may consume LLM API credits.')) return;
@@ -2194,6 +2353,34 @@ function filterCards() {
 <script>
 // Apply initial filter on page load
 filterCards();
+
+// Show more / show less for card abstracts.  Truncation rule: only
+// abstracts clearly longer than 3 lines (more than half a line beyond the
+// 3-line clamp, i.e. over ~3.5 lines) are clipped to 3 lines and get a
+// toggle; shorter ones are shown in full, so a couple of dangling words are
+// never hidden behind a button.
+function setupAbstractToggles() {
+  document.querySelectorAll('.card-abstract').forEach(function (el) {
+    const overflow = el.scrollHeight - el.clientHeight;
+    const halfLine = parseFloat(getComputedStyle(el).lineHeight) / 2;
+    if (overflow > halfLine) {
+      const btn = document.querySelector('.abstract-toggle[data-target="' + el.id + '"]');
+      if (btn) btn.style.display = 'inline-block';
+    } else {
+      el.classList.add('expanded');
+    }
+  });
+}
+function toggleAbstract(btn) {
+  const el = document.getElementById(btn.dataset.target);
+  if (!el) return;
+  const expanded = el.classList.toggle('expanded');
+  btn.innerHTML = expanded ? 'Show less &#9650;' : 'Show more &#9660;';
+}
+document.querySelectorAll('.abstract-toggle').forEach(function (b) {
+  b.addEventListener('click', function () { toggleAbstract(this); });
+});
+setupAbstractToggles();
 </script>
 <script>
 window.APD_DIGEST_STATUS = {{ digest_status_map() | tojson }};
@@ -2391,6 +2578,75 @@ app.jinja_env.globals["calendar_snippet"] = _CALENDAR_SNIPPET
 app.jinja_env.globals["digest_status_map"] = _digest_status_map
 
 
+def _hide_truncated_formulas(text):
+    """Drop the tail of a truncated digest snippet when it cuts a LaTeX
+    formula in half (an unclosed inline/display math group).
+
+    Older digest files store 300-char abstract snippets that may end right in
+    the middle of a formula; without this, the page would show half-rendered
+    math.  Complete formulas are never touched.
+    """
+    if not text:
+        return text
+    i, n = 0, len(text)
+    in_math = False
+    math_start = -1
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] in "([)]":
+            # LaTeX math delimiters: \( \[ \) \]
+            opener = text[i + 1] in "(["
+            in_math = not in_math
+            if opener:
+                math_start = i
+            i += 2
+        elif ch == "\\" and i + 1 < n:
+            i += 2  # escaped character (e.g. \$, \%, \\)
+        elif ch == "$":
+            if i + 1 < n and text[i + 1] == "$":
+                in_math = not in_math
+                if in_math:
+                    math_start = i
+                i += 2
+            else:
+                in_math = not in_math
+                if in_math:
+                    math_start = i
+                i += 1
+        else:
+            i += 1
+    if in_math and math_start >= 0:
+        head = text[:math_start].rstrip()
+        if head.endswith("..."):
+            head = head[:-3].rstrip()
+        return head + "\u2026" if head else "\u2026"
+    return text
+
+
+def _load_full_abstracts(date_str):
+    """Load full abstracts for a digest date from the sidecar file.
+
+    The digest markdown keeps 300-char abstract snippets (for the emailed
+    digest), while output.py writes the full abstracts to
+    digest_<date>.full.json so the desktop digest page can offer a
+    "Show more" / "Show less" toggle.  Older digests without a sidecar
+    degrade gracefully to the snippet stored in the digest file.
+    """
+    if not date_str:
+        return {}
+    sidecar_path = os.path.join(
+        str(_PROJECT_DIR), "output", "digests", f"digest_{date_str}.full.json"
+    )
+    if not os.path.exists(sidecar_path):
+        return {}
+    try:
+        with open(sidecar_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def _render_digest(digest=None):
     """Render digest template with computed variables."""
     d = digest or _current_digest
@@ -2423,8 +2679,26 @@ def _render_digest(digest=None):
             is_update_day=_is_arxiv_update_day(d.get("date", today_str))
         )
     prefs = load_preferences()
+    cfg, _ = _load_config_and_env()
+    apply_to_digest(d, d.get("date", today_str))
     today_str = _digest_today_str()
-    return render_template_string(DIGEST_TEMPLATE, digest=d, prefs=prefs, today_str=today_str)
+    full_abstracts = _load_full_abstracts(d.get("date", ""))
+    # Older digests store 300-char snippets that can cut a LaTeX formula in
+    # half; hide the dangling tail so no half-rendered math is ever shown.
+    for tier in d.get("tiers", []):
+        for p in tier.get("papers", []):
+            abstract = p.get("abstract")
+            if abstract:
+                p["abstract"] = _hide_truncated_formulas(abstract)
+    return render_template_string(
+        DIGEST_TEMPLATE,
+        digest=d,
+        prefs=prefs,
+        display_categories=cfg.get("arxiv_categories") or list(_DEFAULT_ARXIV_CATEGORIES),
+        display_categories_all=list(_DEFAULT_ARXIV_CATEGORIES),
+        today_str=today_str,
+        full_abstracts=full_abstracts,
+    )
 
 
 @app.route("/setup", methods=["GET"])
@@ -2439,6 +2713,7 @@ def settings_page():
     context = _setup_context()
     context["prefs"] = load_preferences()
     context["current_version"] = updater.get_current_version()
+    context["saved"] = request.args.get("saved") == "1"
     return render_template_string(SETTINGS_TEMPLATE, **context)
 
 
@@ -2473,30 +2748,26 @@ def setup_submit():
 
 @app.route("/settings/save", methods=["POST"])
 def settings_save():
-    """Save one settings section (llm | interests) and return to its panel."""
-    section = request.args.get("section", "")
+    """Save all ordinary settings in one transaction."""
     config, env_values = _load_config_and_env()
-
-    if section == "llm":
-        api_key = request.form.get("api_key", "").strip()
-        api_key_env = _apply_llm(
-            config, env_values,
-            provider=request.form.get("provider", "deepseek"),
-            api_key=api_key,
-            model=request.form.get("model", "").strip(),
-            base_url=request.form.get("base_url", "").strip(),
-        )
-        _write_env(env_values)
-        _write_config(config)
-        os.environ[api_key_env] = api_key
-        return redirect("/settings#llm")
-
-    if section == "interests":
-        _apply_interests(config, request)
-        _write_config(config)
-        return redirect("/settings#interests")
-
-    abort(400, "Unknown settings section.")
+    api_key = request.form.get("api_key", "").strip()
+    api_key_env = _apply_llm(
+        config, env_values,
+        provider=request.form.get("provider", "deepseek"),
+        api_key=api_key,
+        model=request.form.get("model", "").strip(),
+        base_url=request.form.get("base_url", "").strip(),
+    )
+    _apply_interests(config, request)
+    prefs = load_preferences()
+    prefs["include_cross"] = request.form.get("include_cross") == "on"
+    prefs["include_replacements"] = request.form.get("include_replacements") == "on"
+    prefs["auto_check_updates"] = request.form.get("auto_check_updates") == "on"
+    _write_env(env_values)
+    _write_config(config)
+    save_preferences(prefs)
+    os.environ[api_key_env] = api_key
+    return redirect("/settings?saved=1#general")
 @app.route("/")
 def index():
     """Landing page: show last viewed or latest digest."""
@@ -2621,6 +2892,21 @@ def run():
     return render_template_string(STATUS_PAGE, display_date=target_date or _digest_today_str(), today_str=_digest_today_str())
 
 
+@app.route("/run/cancel", methods=["POST"])
+def cancel_run():
+    """Request cancellation of the active pipeline run."""
+    global _pipeline_cancel_requested, _pipeline_status, _pipeline_message
+    with _pipeline_lock:
+        if _pipeline_status != "running":
+            return jsonify({"ok": False, "message": "No generation is currently running."}), 409
+        _pipeline_cancel_requested = True
+        _pipeline_message = "Stopping generation…"
+        process_started = _pipeline_process is not None
+    if process_started:
+        Thread(target=_stop_pipeline_process, daemon=True).start()
+    return jsonify({"ok": True})
+
+
 @app.route("/preferences", methods=["GET"])
 def get_preferences():
     return jsonify(load_preferences())
@@ -2700,10 +2986,17 @@ def post_feedback():
                 break
 
     feedback = load_feedback()
-    feedback = [fb for fb in feedback if fb.get("paper_id") != paper_id]
+    if action == "cancel":
+        # Keep compatibility with older clients that sent cancel when a
+        # feedback button was clicked a second time.
+        feedback = [
+            fb for fb in feedback
+            if not (fb.get("paper_id") == paper_id and fb.get("date") == date_str)
+        ]
+        save_feedback(feedback)
+        return jsonify({"ok": True, "score": None, "adjustment": 0})
 
-    if action != "cancel":
-        feedback.append({
+    feedback.append({
             "paper_id": paper_id,
             "title": data.get("title", ""),
             "action": action,
@@ -2712,9 +3005,22 @@ def post_feedback():
             "abstract_snippet": abstract_snippet,
             "date": date_str,
             "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
-        })
+    })
 
     save_feedback(feedback)
+
+    delta = record_adjustment(
+        date_str,
+        paper_id,
+        1 if action == "underrated" else -1,
+    )
+    base_score = 0
+    for tier in (d or {}).get("tiers", []):
+        for paper in tier.get("papers", []):
+            if paper.get("paper_id") == paper_id:
+                base_score = int(paper.get("score", 0) or 0)
+                break
+    effective_score = max(0, min(10, base_score + delta))
 
     # Rebuild the learned profile so the next ranking uses the new feedback.
     try:
@@ -2723,7 +3029,12 @@ def post_feedback():
     except Exception:
         pass  # learned profile is best-effort; never break feedback recording
 
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": True,
+        "score": effective_score,
+        "adjustment": delta,
+        "action": action,
+    })
 
 
 @app.route("/learned-profile", methods=["GET"])
@@ -2901,6 +3212,9 @@ def _run_desktop(server):
         width=1200,
         height=820,
         min_size=(960, 640),
+        # Allow users to select and copy text (papers on the digest page,
+        # error messages / run log on the digest generation page).
+        text_select=True,
     )
     _desktop_window = window
     try:

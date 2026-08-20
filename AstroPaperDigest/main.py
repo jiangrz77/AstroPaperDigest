@@ -23,12 +23,20 @@ os.chdir(_PROJECT_DIR)
 
 from src.profile import build_profile, build_profile_from_config
 from src.fetch_arxiv import fetch_daily_batch
-from src.filter import filter_papers
 from src.ranker import rank_papers
 from src.output import write_bibtex, write_digest, generate_markdown_digest
 from src.notifier import send_digest_email
 from src.digest_parser import parse_digest, get_latest_digest_path
 from src.progress import emit
+
+
+# Every daily digest covers the complete astro-ph announcement.  The user's
+# category preferences are a presentation choice in the desktop digest, not a
+# fetch or ranking constraint.
+ALL_ASTROPH_CATEGORIES = [
+    "astro-ph.CO", "astro-ph.EP", "astro-ph.GA", "astro-ph.HE",
+    "astro-ph.IM", "astro-ph.SR",
+]
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
@@ -152,7 +160,14 @@ def main():
     
     # Override config with CLI args
     filter_cfg = config.get("filter", {})
-    output_cfg = config.get("output", {})
+    output_cfg = dict(config.get("output", {}) or {})
+    # The desktop app stages generated files outside the live output folders.
+    # It commits them only after the child process exits successfully, so a
+    # user cancellation cannot replace an existing digest.
+    staging_dir = os.environ.get("APD_OUTPUT_STAGING_DIR", "").strip()
+    if staging_dir:
+        output_cfg["digest_dir"] = os.path.join(staging_dir, "digests")
+        output_cfg["bibtex_dir"] = os.path.join(staging_dir, "bibtex")
     threshold = args.threshold if args.threshold is not None else filter_cfg.get("score_threshold", 7)
     
     print("=== Astro Paper Digest ===\n")
@@ -189,19 +204,12 @@ def main():
     # Step 2: Fetch papers
     print("\n[2/5] Fetching papers...")
     emit("fetch", 0, 0, "Contacting arXiv…")
-    categories = config.get("arxiv_categories", [
-        "astro-ph.CO",
-        "astro-ph.EP",
-        "astro-ph.GA",
-        "astro-ph.HE",
-        "astro-ph.IM",
-        "astro-ph.SR",
-    ])
+    display_categories = config.get("arxiv_categories", ALL_ASTROPH_CATEGORIES)
     include_cross = not args.no_cross
     include_replacements = not args.no_replacements
     try:
         result = fetch_daily_batch(
-            categories,
+            ALL_ASTROPH_CATEGORIES,
             include_cross=include_cross,
             include_replacements=include_replacements,
             target_date=arxiv_date,
@@ -237,20 +245,19 @@ def main():
     papers = result["papers"]
     print(f"  Fetched {len(papers)} papers")
 
-    # The official astro-ph listing includes every astro-ph subcategory.  A
-    # user's category selection deliberately narrows that batch before the
-    # papers are scored, so make the distinction explicit in both the CLI and
-    # the desktop app's streamed progress message.
+    # The official astro-ph listing is the complete daily digest scope.
+    # Saved category preferences only control the default presentation in the
+    # desktop digest; they never exclude papers from fetching or scoring.
     official_total = result.get("official_total")
     if official_total is not None:
-        category_label = ", ".join(categories)
+        category_label = ", ".join(display_categories)
         scope_message = (
             f"Official astro-ph batch: {official_total} papers. "
-            f"Selected categories ({category_label}): {len(papers)} papers "
-            "will be processed."
+            f"All {len(papers)} papers will be scored. Default display "
+            f"categories: {category_label}."
         )
         print(f"  {scope_message}")
-        emit("fetch", len(papers), official_total, scope_message)
+        emit("fetch", official_total, official_total, scope_message)
     
     # Count paper types
     if papers:
@@ -284,17 +291,12 @@ def main():
                 _write_empty_digest(digest_dir, "no_new_papers", arxiv_date)
                 return
     
-    # Step 3: Filter papers
-    print("\n[3/5] Filtering papers...")
-    keywords = config.get("keywords", [])
-    max_candidates = filter_cfg.get("max_candidates_for_llm", 50)
-    candidates = filter_papers(papers, categories, keywords, max_candidates)
-    
-    if not candidates:
-        print("  No papers matched the filter criteria. Writing empty digest.")
-        digest_dir = output_cfg.get("digest_dir", "./output/digests")
-        _write_empty_digest(digest_dir, "no_matches", arxiv_date)
-        return
+    # Step 3: Prepare the complete batch.  Keywords and bibliography remain
+    # part of the research profile supplied to the LLM, but no paper is
+    # dropped before ranking.
+    print("\n[3/5] Preparing complete batch for scoring...")
+    emit("filter", len(papers), len(papers), f"All {len(papers)} papers will be scored.")
+    candidates = list(papers)
     
     # Step 4: Rank papers with LLM
     if args.dry_run:
@@ -318,12 +320,13 @@ def main():
     
     print(f"  Top scored paper: {ranked[0]['title'][:80]}... (score: {ranked[0]['score']})")
     
-    # Include unranked papers (those that didn't pass the filter) with score 0
+    # Keep failed/unranked papers visible if an individual scoring request did
+    # not return a result.
     ranked_ids = {p["id"] for p in ranked}
     unranked = [p for p in papers if p["id"] not in ranked_ids]
     for p in unranked:
         p["score"] = 0
-        p["reason"] = "Not ranked (below keyword threshold)"
+        p["reason"] = "Not scored"
     all_papers = ranked + unranked
     print(f"  Including {len(unranked)} unranked papers in digest")
     

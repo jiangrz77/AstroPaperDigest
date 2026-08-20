@@ -39,6 +39,7 @@ echo "==> Building self-contained .app ..."
   --icon "$APP_ROOT/assets/AppIcon.icns" \
   --paths "$APP_ROOT" \
   --collect-all webview \
+  --add-data "$APP_ROOT/static:static" \
   --add-binary "$APP_ROOT/build/cli/apd-cli:." \
   --distpath "$APP_ROOT/dist" --workpath "$APP_ROOT/build/pyi-app" --specpath "$APP_ROOT/build" \
   "$APP_ROOT/src/gui.py" > "$APP_ROOT/build/app-build.log" 2>&1
