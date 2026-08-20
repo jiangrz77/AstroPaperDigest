@@ -2021,8 +2021,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .fb-minus{color:#95a5a6}.fb-minus:hover{background:#f1f5f9;border-color:#cbd5e1}
 .fb-plus{color:#f4b400}.fb-plus:hover{background:#fff8db;border-color:#f4b400}
 .fb-btn:disabled{opacity:.38;cursor:default;background:#fff;border-color:#ddd}
-.btn-order-refresh{height:36px;padding:0 14px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#475569;font-size:13px;font-weight:600;cursor:pointer}
-.btn-order-refresh:hover{border-color:#93c5fd;background:#eff6ff;color:#1d4ed8}
+.btn-order-refresh{position:fixed;right:24px;bottom:24px;z-index:120;width:48px;height:48px;padding:0;border:1px solid #93c5fd;border-radius:50%;background:#fff;color:#2563eb;font-size:24px;font-weight:600;line-height:1;cursor:pointer;box-shadow:0 4px 14px rgba(37,99,235,.22);transition:background .16s ease,transform .16s ease,box-shadow .16s ease}
+.btn-order-refresh:hover{background:#eff6ff;transform:translateY(-2px);box-shadow:0 7px 18px rgba(37,99,235,.28)}
+.btn-order-refresh:focus-visible{outline:3px solid rgba(37,99,235,.3);outline-offset:2px}
 .filter-menu{position:relative;margin-left:auto}
 .btn-filter{height:36px;display:flex;align-items:center;gap:7px;padding:0 11px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#334155;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
 .btn-filter:hover,.btn-filter[aria-expanded="true"]{border-color:#93c5fd;background:#eff6ff;color:#1d4ed8}
@@ -2075,10 +2076,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   </div>
 </div>
 <div class="toolbar">
-  <button class="btn-refresh" onclick="rerunWithPrefs()" title="Regenerate digest">regen digest</button>
+  <button class="btn-refresh" onclick="rerunWithPrefs()" title="Regenerate digest">Regenerate</button>
   <span class="paper-total stats" aria-label="Displayed paper count">{{ digest.total_papers }} papers</span>
   {% for star in (5, 4, 3, 2, 1) %}<button class="btn-nav btn-nav-star nav-star-{{ star }}" data-score-nav="{{ star }}" aria-label="{{ star }}-star papers" onclick="scrollToScore({{ star }})">{{ '★' * star }} (<span class="btn-score-count">{{ score_counts.get(star, 0) }}</span>)</button>{% endfor %}
-  <button class="btn-order-refresh" id="refresh-order" type="button" hidden onclick="refreshOrder()">refresh</button>
   <div class="filter-menu" id="filter-menu">
     <button class="btn-filter" type="button" id="filter-trigger" aria-expanded="false" aria-controls="filter-popover">
       <span>Filters</span><span class="filter-summary" id="filter-summary"></span><span class="filter-chevron" aria-hidden="true">⌄</span>
@@ -2141,6 +2141,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   {% endfor %}
 {% endfor %}
 </div>
+<button class="btn-order-refresh" id="refresh-order" type="button" hidden onclick="refreshOrder()" title="Refresh order" aria-label="Refresh order">↻</button>
 <script>
 const DIGEST_DATE = {{ digest.date | tojson }};
 function showScopeBanner() {
