@@ -1,6 +1,7 @@
 """LLM-based relevance scoring for arxiv papers using DeepSeek (OpenAI-compatible API)."""
 
 import json
+import math
 import os
 import statistics
 import time
@@ -17,20 +18,35 @@ from .preference_learning import (
     ensure_learned_profile,
     format_learned_weights_block,
 )
-from .progress import emit
+from .progress import emit, log
 
 from src import paths as _paths
 FEEDBACK_FILE = str(_paths.data_dir() / "feedback.json")
 
 # --- Ranking tunables -------------------------------------------------------
-BATCH_SIZE = 50          # papers per LLM request (context- and response-safe)
-VOTES = 5                # independent LLM calls per batch; per-paper median wins
-MIN_VOTES = 3            # below this many valid votes a paper is marked No score
-MAX_WORKERS = 3          # parallel LLM calls (bounded; 429 backoff keeps it polite)
+TARGET_BATCH_SIZE = 50   # papers per batch (balanced distribution, ~50 each)
+VOTES = 3                # independent LLM calls per batch; per-paper median wins
+MIN_VOTES = 2            # below this many valid votes a paper is marked No score
+MAX_WORKERS = 5          # cap on parallel LLM calls (adaptive; 429 backoff keeps it polite)
 RETRY_ATTEMPTS = 1       # extra attempt after the first failure (one retry)
 RETRY_BACKOFF = 3.0      # seconds before a normal retry
 RETRY_BACKOFF_429 = 30.0 # seconds before a retry after HTTP 429 (rate limited)
 MAX_ATTEMPTS_429 = 3     # total tries for rate-limited calls (initial + 2 retries)
+
+
+def split_papers_into_batches(papers: list, target: int = TARGET_BATCH_SIZE) -> list:
+    """Split papers into a small number of balanced batches (~target each).
+
+    The number of batches is the integer nearest to n/target, so every batch
+    stays close to the target size and there is never a tiny trailing batch
+    that would waste the per-request fixed prompt overhead.
+    """
+    n = len(papers)
+    if n <= target:
+        return [list(papers)]
+    n_batches = max(1, round(n / target))
+    per = math.ceil(n / n_batches)
+    return [papers[i * per:(i + 1) * per] for i in range(n_batches)]
 
 
 def get_client(base_url: str, api_key: str) -> OpenAI:
@@ -115,7 +131,7 @@ You are an astrophysics research assistant. For each candidate paper above, scor
 For each paper, provide:
 1. The paper index [i]
 2. A relevance score (integer 0-10)
-3. A one-line reason explaining the score
+3. A brief reason of no more than 12 words explaining the score
 
 Respond ONLY with a valid JSON array in this exact format, no other text:
 [
@@ -127,6 +143,71 @@ Respond ONLY with a valid JSON array in this exact format, no other text:
     return prompt
 
 
+def _parse_score_response(content: str) -> tuple[list[dict], bool]:
+    """Parse a score array, recovering complete objects from a truncated reply.
+
+    Some providers return a valid prefix of the requested JSON array before
+    hitting an output limit or producing an unterminated final reason string.
+    Those complete scores are still useful votes; retrying the whole batch
+    would discard them and can reproduce the same failure.
+
+    Returns (normalized_items, recovered_partial_response).
+    """
+    text = (content or "").strip()
+    if "```" in text:
+        blocks = text.split("```")
+        if len(blocks) >= 2:
+            text = blocks[1].strip()
+            if text.lower().startswith("json"):
+                text = text[4:].lstrip()
+
+    partial = False
+    try:
+        parsed = json.loads(text)
+        if not isinstance(parsed, list):
+            raise ValueError("Expected JSON array")
+    except (json.JSONDecodeError, ValueError):
+        array_start = text.find("[")
+        if array_start < 0:
+            raise ValueError("Expected JSON array")
+        decoder = json.JSONDecoder()
+        cursor = array_start + 1
+        parsed = []
+        while cursor < len(text):
+            while cursor < len(text) and text[cursor] in " \t\r\n,":
+                cursor += 1
+            if cursor >= len(text) or text[cursor] == "]":
+                break
+            if text[cursor] != "{":
+                break
+            try:
+                item, end = decoder.raw_decode(text, cursor)
+            except json.JSONDecodeError:
+                break
+            parsed.append(item)
+            cursor = end
+        if not parsed:
+            raise ValueError("No complete score objects in LLM response")
+        partial = True
+
+    items = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        try:
+            score = max(0, min(10, int(item.get("score", 5))))
+            items.append({
+                "index": int(item.get("index", -1)),
+                "score": score,
+                "reason": str(item.get("reason", "")),
+            })
+        except (TypeError, ValueError):
+            continue
+    if not items:
+        raise ValueError("No valid score objects in LLM response")
+    return items, partial
+
+
 def rank_papers(
     papers: list[dict],
     profile: dict,
@@ -135,8 +216,8 @@ def rank_papers(
     """Use LLM to rank papers by relevance to the user's interests.
 
     Each batch of papers is scored by VOTES independent LLM calls with the
-    same prompt; the per-paper median wins (median-of-5 voting reduces score
-    noise). A paper with fewer than MIN_VOTES valid votes is marked with
+    same prompt; the per-paper median wins (median voting over VOTES calls
+    reduces score noise). A paper with fewer than MIN_VOTES valid votes is marked with
     scoring_failed and score 0 so the UI can show "No score" instead of a
     fabricated number. Progress events report completed batches.
 
@@ -170,10 +251,19 @@ def rank_papers(
     client = get_client(base_url, api_key)
     profile_text = profile_to_prompt_text(profile)
 
-    total_batches = (len(papers) + BATCH_SIZE - 1) // BATCH_SIZE
+    batches = split_papers_into_batches(papers, TARGET_BATCH_SIZE)
+    total_batches = len(batches)
+    batch_starts = []
+    paper_batch_of = [0] * len(papers)
+    _offset = 0
+    for _bi, _b in enumerate(batches):
+        batch_starts.append(_offset)
+        for _k in range(len(_b)):
+            paper_batch_of[_offset + _k] = _bi
+        _offset += len(_b)
     emit("rank", 0, total_batches,
          f"Starting… ({total_batches} batch{'es' if total_batches != 1 else ''}, "
-         f"{BATCH_SIZE} papers each, {VOTES} votes)")
+         f"~{TARGET_BATCH_SIZE} papers each, {VOTES} votes)")
 
     # votes per paper: {paper_idx: {"scores": [...], "reasons": [...]}}
     results = {i: {"scores": [], "reasons": []} for i in range(len(papers))}
@@ -199,25 +289,12 @@ def rank_papers(
                 if content is None:
                     raise ValueError("Empty LLM response")
                 content = content.strip()
-                # Handle markdown-wrapped JSON
-                if content.startswith("```"):
-                    content = content.split("```")[1]
-                    if content.startswith("json"):
-                        content = content[4:]
-                    content = content.strip()
-                scores = json.loads(content)
-                if not isinstance(scores, list):
-                    raise ValueError("Expected JSON array")
-                items = []
-                for s in scores:
-                    try:
-                        items.append({
-                            "index": int(s.get("index", -1)),
-                            "score": int(s.get("score", 5)),
-                            "reason": str(s.get("reason", "")),
-                        })
-                    except (TypeError, ValueError):
-                        continue
+                items, recovered_partial = _parse_score_response(content)
+                if recovered_partial:
+                    log(
+                        f"  Recovered {len(items)} complete scores from a partial "
+                        f"LLM response (batch {batch_idx + 1})"
+                    )
                 return items, ""
             except Exception as e:
                 last_error = str(e) or e.__class__.__name__
@@ -225,20 +302,20 @@ def rank_papers(
                 max_attempts = MAX_ATTEMPTS_429 if is_429 else RETRY_ATTEMPTS + 1
                 if attempt < max_attempts - 1:
                     backoff = RETRY_BACKOFF_429 if is_429 else RETRY_BACKOFF
-                    print(f"  LLM call failed (batch {batch_idx + 1}); retrying in {backoff:.0f}s ({last_error})")
+                    log(f"  LLM call failed (batch {batch_idx + 1}); retrying in {backoff:.0f}s ({last_error})")
                     time.sleep(backoff)
                 else:
-                    print(f"  LLM call failed permanently (batch {batch_idx + 1}): {last_error}")
+                    log(f"  LLM call failed permanently (batch {batch_idx + 1}): {last_error}")
                     break
         return [], last_error
 
     batch_errors = [""] * total_batches
 
     def _vote(batch_idx: int, vote_idx: int):
-        start = batch_idx * BATCH_SIZE
-        end = min(start + BATCH_SIZE, len(papers))
-        batch = papers[start:end]
-        print(f"  Ranking batch {batch_idx + 1}/{total_batches} (vote {vote_idx + 1}/{VOTES})...")
+        start = batch_starts[batch_idx]
+        batch = batches[batch_idx]
+        end = start + len(batch)
+        log(f"  Ranking batch {batch_idx + 1}/{total_batches} (vote {vote_idx + 1}/{VOTES})...")
         prompt = build_ranking_prompt(profile_text, batch, learned_profile=learned_profile)
         items, err = _call_batch(batch_idx, prompt)
         with results_lock:
@@ -251,7 +328,8 @@ def rank_papers(
                     if item["reason"]:
                         results[idx]["reasons"].append(item["reason"])
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    workers = max(1, min(MAX_WORKERS, total_batches * VOTES))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(_vote, b, v): (b, v)
             for b in range(total_batches)
@@ -267,7 +345,7 @@ def rank_papers(
             if batch_votes_done[b] == VOTES:
                 done = sum(1 for n in batch_votes_done if n == VOTES)
                 emit("rank", done, total_batches,
-                     f"{done}/{total_batches} batches scored ({BATCH_SIZE} papers each)")
+                     f"{done}/{total_batches} batches scored")
 
     emit("rank", total_batches, total_batches, "All batches scored")
 
@@ -286,11 +364,11 @@ def rank_papers(
             reasons = results[idx]["reasons"]
             p["reason"] = Counter(reasons).most_common(1)[0][0] if reasons else "No reason provided"
         else:
-            err = batch_errors[idx // BATCH_SIZE] if total_batches else ""
+            err = batch_errors[paper_batch_of[idx]] if total_batches else ""
             p["scoring_failed"] = True
             p["score_adjustment"] = 0.0
             p["score"] = 0
-            p["reason"] = f"Scoring failed — no score assigned ({err or 'fewer than 3 valid votes'})"
+            p["reason"] = f"Scoring failed — no score assigned ({err or 'fewer than 2 valid votes'})"
         scored_papers.append(p)
 
     # Sort by score descending

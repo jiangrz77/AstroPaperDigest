@@ -14,19 +14,32 @@ CLI see the same lines as readable status text.
 """
 
 import json
+from threading import Lock
 
 PREFIX = "PROGRESS "
 
+# stdout may be written by several pipeline threads at once (e.g. concurrent
+# rank votes); a plain print() is two writes (text + newline) and can
+# interleave across threads. One lock keeps every emitted line atomic.
+_STDOUT_LOCK = Lock()
+
 
 def emit(stage: str, done: int = 0, total: int = 0, message: str = "") -> None:
-    """Print one machine-readable progress event to stdout."""
+    """Print one machine-readable progress event to stdout (thread-safe)."""
     payload = {
         "stage": str(stage),
         "done": int(done),
         "total": int(total),
         "message": str(message),
     }
-    print(f"{PREFIX}{json.dumps(payload, ensure_ascii=False)}", flush=True)
+    with _STDOUT_LOCK:
+        print(f"{PREFIX}{json.dumps(payload, ensure_ascii=False)}", flush=True)
+
+
+def log(message: str) -> None:
+    """Print one human-readable pipeline line to stdout (thread-safe)."""
+    with _STDOUT_LOCK:
+        print(message, flush=True)
 
 
 def parse(line: str):
