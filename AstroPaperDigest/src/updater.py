@@ -105,6 +105,12 @@ def _http_json(url: str, timeout: int = NETWORK_TIMEOUT):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _update_package_name(version: str) -> str:
+    """Name of this channel's update package (source zip vs .app bundle zip)."""
+    suffix = ".app" if getattr(sys, "frozen", False) else ".source"
+    return f"AstroPaperDigest-v{version}{suffix}.zip"
+
+
 def normalize_release(data: dict) -> dict:
     """Map a GitHub release object to our normalized shape."""
     version = (data.get("tag_name") or "").lstrip("v")
@@ -115,7 +121,7 @@ def normalize_release(data: dict) -> dict:
     ]
     exact = [
         a for a in zip_assets
-        if a.get("name") == f"AstroPaperDigest-v{version}.zip"
+        if a.get("name") == _update_package_name(version)
     ]
     chosen = (exact or zip_assets or [None])[0]
     download_url = ""
@@ -276,7 +282,20 @@ def _backup_and_replace(new_root: Path, log) -> None:
 
 
 def apply_update(version: str, zip_path: Path, log) -> dict:
-    """Extract zip, backup old code, replace, rebuild .app, relaunch."""
+    """Install a new version.
+
+    Frozen (self-contained .app): the update package is a zip of the whole
+    AstroPaperDigest.app bundle - replace the running bundle in place and
+    relaunch.  Source mode keeps the historical behavior (replace source
+    files, rebuild the .app).
+    """
+    if getattr(sys, "frozen", False):
+        return _apply_frozen_bundle(version, zip_path, log)
+    return _apply_source(version, zip_path, log)
+
+
+def _apply_source(version: str, zip_path: Path, log) -> dict:
+    """Source channel: extract zip, backup old code, replace, rebuild .app."""
     log(f"Installing v{version} ...")
     if not zip_path.exists():
         raise UpdateApplyError(f"Update package not found: {zip_path}")
@@ -323,6 +342,70 @@ def apply_update(version: str, zip_path: Path, log) -> dict:
             relaunched = True
     if not relaunched:
         log("Please restart the app manually after installation.")
+    return {"ok": True}
+
+
+def _apply_frozen_bundle(version: str, zip_path: Path, log) -> dict:
+    """Frozen channel: replace the running .app bundle with the update zip."""
+    log(f"Installing v{version} (whole-bundle replace) ...")
+    if not zip_path.exists():
+        raise UpdateApplyError(f"Update package not found: {zip_path}")
+
+    # The updater process itself runs from inside the bundle we replace:
+    #   <App>.app/Contents/Frameworks/apd-cli
+    exe = Path(sys.executable).resolve()
+    app_bundle = exe.parent.parent.parent
+    if app_bundle.suffix != ".app" or not (app_bundle / "Contents" / "Info.plist").exists():
+        raise UpdateApplyError(f"Could not locate the app bundle (resolved exe: {exe})")
+
+    # ditto (not zipfile) so symlinks inside the .app survive extraction.
+    with tempfile.TemporaryDirectory(prefix="apd-update-") as td:
+        root = Path(td)
+        res = subprocess.run(
+            ["ditto", "-x", "-k", str(zip_path), str(root)],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            raise UpdateApplyError(f"Failed to extract update package: {(res.stderr or '')[-500:]}")
+        entries = [p for p in root.iterdir() if p.name != "__MACOSX"]
+        if len(entries) != 1 or not entries[0].is_dir():
+            raise UpdateApplyError("Invalid update package: expected one .app folder.")
+        new_app = entries[0]
+        if new_app.suffix != ".app" or not (new_app / "Contents" / "Info.plist").exists():
+            raise UpdateApplyError("Invalid update package: not a .app bundle.")
+        if new_app.name != app_bundle.name:
+            new_app = new_app.rename(root / app_bundle.name)
+
+        backup = app_bundle.with_name(
+            f"{app_bundle.name}.old-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        )
+        log(f"Replacing {app_bundle}")
+        shutil.move(str(app_bundle), str(backup))
+        try:
+            shutil.move(str(new_app), str(app_bundle))
+        except Exception:
+            shutil.move(str(backup), str(app_bundle))  # roll back
+            raise
+
+    # Record the installed version in the data dir (the bundle carries none).
+    try:
+        (_PROJECT_DIR / "version.txt").write_text(f"{version}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+    # Relaunch the new bundle (skip with APD_UPDATE_NO_RELAUNCH=1 in tests).
+    if os.environ.get("APD_UPDATE_NO_RELAUNCH") != "1":
+        subprocess.Popen(["open", str(app_bundle)])
+        log(f"Restarted {app_bundle.name}")
+
+    # Best-effort, detached cleanup of the old bundle.
+    subprocess.Popen(
+        ["rm", "-rf", str(backup)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
     return {"ok": True}
 
 

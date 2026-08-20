@@ -20,3 +20,7 @@ AstroPaperDigest.app/
 # Canvas reports (IDE-generated)
 *.canvas.tsx
 *.canvas.data.json
+
+# PyInstaller build output
+build/
+dist/

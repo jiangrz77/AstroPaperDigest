@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-14   # Apple Silicon (arm64). For Intel support add macos-13 to a matrix.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # release.sh needs the triggering tag
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r AstroPaperDigest/requirements.txt
+          pip install pyinstaller
+
+      - name: Build release artifacts (app + dmg + source/app zips + version.json)
+        working-directory: AstroPaperDigest
+        run: ./release.sh
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            AstroPaperDigest/dist/AstroPaperDigest-*.dmg
+            AstroPaperDigest/dist/AstroPaperDigest-v*.app.zip
+            AstroPaperDigest/dist/AstroPaperDigest-v*.source.zip
+            AstroPaperDigest/dist/version.json
