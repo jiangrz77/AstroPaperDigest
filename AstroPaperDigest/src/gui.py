@@ -2135,7 +2135,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <div class="card-actions">
       {% if paper.link %}<a href="{{ paper.link }}" target="_blank">arxiv:{{ paper.paper_id }}</a>{% endif %}
       {% if not paper.scoring_failed %}<button class="fb-btn fb-plus" data-id="{{ paper.paper_id }}" data-title="{{ paper.title[:80] }}" onclick="giveFeedback(this,'underrated')" title="Increase by one star" aria-label="Increase rating by one star" {% if paper.score >= 5 %}disabled{% endif %}>+ ★</button>
-      <button class="fb-btn fb-minus" data-id="{{ paper.paper_id }}" data-title="{{ paper.title[:80] }}" onclick="giveFeedback(this,'overrated')" title="Reduce by one star" aria-label="Reduce rating by one star" {% if paper.score <= 1 %}disabled{% endif %}>− ★</button>{% endif %}
+      <button class="fb-btn fb-minus" data-id="{{ paper.paper_id }}" data-title="{{ paper.title[:80] }}" onclick="giveFeedback(this,'overrated')" title="Reduce by one star" aria-label="Reduce rating by one star" {% if paper.score <= 1 %}disabled{% endif %}>− ☆</button>{% endif %}
     </div>
   </div>
   {% endfor %}
