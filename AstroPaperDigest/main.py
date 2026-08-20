@@ -236,6 +236,21 @@ def main():
 
     papers = result["papers"]
     print(f"  Fetched {len(papers)} papers")
+
+    # The official astro-ph listing includes every astro-ph subcategory.  A
+    # user's category selection deliberately narrows that batch before the
+    # papers are scored, so make the distinction explicit in both the CLI and
+    # the desktop app's streamed progress message.
+    official_total = result.get("official_total")
+    if official_total is not None:
+        category_label = ", ".join(categories)
+        scope_message = (
+            f"Official astro-ph batch: {official_total} papers. "
+            f"Selected categories ({category_label}): {len(papers)} papers "
+            "will be processed."
+        )
+        print(f"  {scope_message}")
+        emit("fetch", len(papers), official_total, scope_message)
     
     # Count paper types
     if papers:

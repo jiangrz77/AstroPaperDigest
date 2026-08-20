@@ -664,6 +664,11 @@ def fetch_daily_batch(
                 **resolved,
                 "status": "ok",
                 "papers": papers,
+                # ``ids`` is the complete official astro-ph batch.  ``papers``
+                # is intentionally narrower when the user selects only some
+                # astro-ph subcategories, so expose both counts to callers.
+                "official_total": len(resolved["ids"]),
+                "selected_total": len(papers),
                 "message": (
                     f"Official astro-ph listing: {len(resolved['ids'])} "
                     f"entries for {_recent_date_label(target_date)} "
@@ -679,7 +684,13 @@ def fetch_daily_batch(
                 include_replacements,
                 trust_env=False,
             )
-            return {**resolved, "status": "ok", "papers": papers}
+            return {
+                **resolved,
+                "status": "ok",
+                "papers": papers,
+                "official_total": len(resolved["ids"]),
+                "selected_total": len(papers),
+            }
 
     if resolved["status"] == "listing_unavailable":
         cutoff_start, cutoff_end = resolved["window_utc"]
@@ -696,6 +707,10 @@ def fetch_daily_batch(
             **resolved,
             "status": "ok",
             "papers": papers,
+            # The API fallback cannot reliably tell us the full official
+            # listing total, only the number matching the selected categories.
+            "official_total": None,
+            "selected_total": len(papers),
             "message": f"API fallback (official listing unavailable) for {target_date}: {len(papers)} papers.",
         }
 

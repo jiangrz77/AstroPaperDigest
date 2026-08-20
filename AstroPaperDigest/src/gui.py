@@ -58,6 +58,7 @@ _pipeline_process = None
 _pipeline_started_at = None
 _pipeline_progress = {"stage": "", "done": 0, "total": 0, "message": ""}
 _pipeline_log = deque(maxlen=60)
+_pipeline_batch_summary = None
 _pipeline_lock = Lock()
 _desktop_window = None
 _server = None
@@ -68,6 +69,20 @@ _run_lock_fh = None
 _APD_APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "AstroPaperDigest"
 _APD_LOCK_PATH = _APD_APP_SUPPORT_DIR / "apd.lock"
 _APD_RUN_INFO_PATH = _APD_APP_SUPPORT_DIR / "apd-run.json"
+
+_DEFAULT_ARXIV_CATEGORIES = (
+    "astro-ph.GA",
+    "astro-ph.SR",
+    "astro-ph.HE",
+    "astro-ph.CO",
+    "astro-ph.IM",
+    "astro-ph.EP",
+)
+_BATCH_SUMMARY_RE = re.compile(
+    r"Official astro-ph batch: (?P<official>\d+) papers\. "
+    r"Selected categories \((?P<categories>.+)\): "
+    r"(?P<selected>\d+) papers will be processed\."
+)
 
 # --- Update check state ---
 _update_state = {
@@ -191,13 +206,13 @@ def _apply_llm(config: dict, env_values: dict, provider: str, api_key: str,
 
 
 def _apply_interests(config: dict, request) -> None:
-    """Update research-interest settings (quick keywords or bib profile)."""
+    """Update paper categories and the selected research-profile source."""
     profile_mode = request.form.get("profile_mode", "quick")
+    categories = request.form.getlist("categories")
+    if categories:
+        config["arxiv_categories"] = categories
     if profile_mode == "quick":
-        categories = request.form.getlist("categories")
         keywords_raw = request.form.get("keywords", "").strip()
-        if categories:
-            config["arxiv_categories"] = categories
         if keywords_raw:
             config["keywords"] = [k.strip() for k in keywords_raw.split(",") if k.strip()]
     else:
@@ -264,7 +279,9 @@ def _setup_context() -> dict:
             "DEEPSEEK_API_KEY",
             env_vars.get("OPENAI_API_KEY", env_vars.get("CUSTOM_API_KEY", "")),
         ),
-        "cur_categories": cfg.get("arxiv_categories", []),
+        # New users start with the full astro-ph set; existing saved choices
+        # (including a deliberate GA-only scope) are preserved.
+        "cur_categories": cfg.get("arxiv_categories") or list(_DEFAULT_ARXIV_CATEGORIES),
         "cur_keywords": ", ".join(cfg.get("keywords", [])),
         "cur_bib_file": cfg.get("bib_file", ""),
         "cur_email_sender": email_cfg.get("sender", ""),
@@ -574,7 +591,10 @@ def _pipeline_progress_message(line: str) -> str:
         return ""
     if line.startswith("["):
         return line
-    if line.startswith(("Fetched ", "Category filter:", "Keyword filter:")):
+    if line.startswith((
+        "Fetched ", "Category filter:", "Keyword filter:",
+        "Official astro-ph batch:",
+    )):
         return line
     if line.startswith("Sending email"):
         return "Sending email notification..."
@@ -663,10 +683,11 @@ def _stream_pipeline(cmd: list[str], timeout: int = 900) -> tuple[int, str]:
 def run_pipeline(include_cross: bool = True, include_replacements: bool = True, target_date: str = ""):
     """Run the recommendation pipeline in a background thread."""
     global _current_digest, _pipeline_status, _pipeline_message
-    global _pipeline_started_at, _pipeline_progress
+    global _pipeline_started_at, _pipeline_progress, _pipeline_batch_summary
     _pipeline_status = "running"
     _pipeline_started_at = time.time()
     _pipeline_log.clear()
+    _pipeline_batch_summary = None
     _pipeline_progress = {
         "stage": "profile",
         "done": 0,
@@ -689,6 +710,13 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
             cmd.extend(["--target-date", target_date])
         
         return_code, stdout = _stream_pipeline(cmd)
+        summary_match = _BATCH_SUMMARY_RE.search(stdout)
+        if summary_match:
+            _pipeline_batch_summary = {
+                "official_total": int(summary_match.group("official")),
+                "selected_total": int(summary_match.group("selected")),
+                "categories": summary_match.group("categories"),
+            }
         if return_code == 0:
             # Locate the digest actually written by this run. Prefer the file
             # for the requested date, then the latest file, then the path the
@@ -774,13 +802,14 @@ def _start_pipeline(
     target_date: str = "",
 ) -> bool:
     """Start at most one pipeline process."""
-    global _pipeline_status, _pipeline_message
+    global _pipeline_status, _pipeline_message, _pipeline_batch_summary
 
     with _pipeline_lock:
         if _pipeline_status == "running":
             return False
         _pipeline_status = "running"
         _pipeline_message = "[1/5] Starting pipeline..."
+        _pipeline_batch_summary = None
         Thread(
             target=run_pipeline,
             kwargs={
@@ -1021,20 +1050,23 @@ textarea{height:80px;resize:vertical}
 
   <div class="step">
     <h2><span class="step-num">2</span>Research Interests</h2>
+    <h3 style="font-size:14px;color:#2c3e50;margin-bottom:4px">Paper Categories</h3>
+    <p class="hint">Choose which arXiv categories are included in every daily digest.</p>
+    <div class="checkbox-grid">
+      <label><input type="checkbox" name="categories" value="astro-ph.GA" {% if 'astro-ph.GA' in cur_categories %}checked{% endif %}> astro-ph.GA</label>
+      <label><input type="checkbox" name="categories" value="astro-ph.SR" {% if 'astro-ph.SR' in cur_categories %}checked{% endif %}> astro-ph.SR</label>
+      <label><input type="checkbox" name="categories" value="astro-ph.HE" {% if 'astro-ph.HE' in cur_categories %}checked{% endif %}> astro-ph.HE</label>
+      <label><input type="checkbox" name="categories" value="astro-ph.CO" {% if 'astro-ph.CO' in cur_categories %}checked{% endif %}> astro-ph.CO</label>
+      <label><input type="checkbox" name="categories" value="astro-ph.IM" {% if 'astro-ph.IM' in cur_categories %}checked{% endif %}> astro-ph.IM</label>
+      <label><input type="checkbox" name="categories" value="astro-ph.EP" {% if 'astro-ph.EP' in cur_categories %}checked{% endif %}> astro-ph.EP</label>
+    </div>
+
+    <h3 style="font-size:14px;color:#2c3e50;margin:22px 0 10px">Research Profile</h3>
     <div class="toggle-group">
       <label><input type="radio" name="profile_mode" value="quick" checked onchange="toggleProfileMode()"> Quick Start</label>
       <label><input type="radio" name="profile_mode" value="bib" onchange="toggleProfileMode()"> Use Bib File</label>
     </div>
     <div id="quick-mode">
-      <label>Arxiv Categories</label>
-      <div class="checkbox-grid">
-        <label><input type="checkbox" name="categories" value="astro-ph.GA" {% if 'astro-ph.GA' in cur_categories %}checked{% endif %}> astro-ph.GA</label>
-        <label><input type="checkbox" name="categories" value="astro-ph.SR" {% if 'astro-ph.SR' in cur_categories %}checked{% endif %}> astro-ph.SR</label>
-        <label><input type="checkbox" name="categories" value="astro-ph.HE" {% if 'astro-ph.HE' in cur_categories %}checked{% endif %}> astro-ph.HE</label>
-        <label><input type="checkbox" name="categories" value="astro-ph.CO" {% if 'astro-ph.CO' in cur_categories %}checked{% endif %}> astro-ph.CO</label>
-        <label><input type="checkbox" name="categories" value="astro-ph.IM" {% if 'astro-ph.IM' in cur_categories %}checked{% endif %}> astro-ph.IM</label>
-        <label><input type="checkbox" name="categories" value="astro-ph.EP" {% if 'astro-ph.EP' in cur_categories %}checked{% endif %}> astro-ph.EP</label>
-      </div>
       <label for="keywords">Keywords (comma-separated)</label>
       <textarea id="keywords" name="keywords" placeholder="e.g. first stars, chemical evolution, supernova, stellar abundances">{{ cur_keywords or '' }}</textarea>
       <p class="hint">These help filter and rank papers relevant to your research.</p>
@@ -1184,9 +1216,7 @@ textarea{height:90px;resize:vertical}
   <nav class="sidebar">
     <div class="sidebar-nav">
       <button class="nav-item active" data-section="general" onclick="activate('general')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>General</button>
-      <button class="nav-item" data-section="llm" onclick="activate('llm')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/></svg></span>LLM &amp; API</button>
       <button class="nav-item" data-section="interests" onclick="activate('interests')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></span>Research Interests</button>
-      <button class="nav-item" data-section="learned" onclick="activate('learned')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg></span>Learned Preferences</button>
       <button class="nav-item" data-section="email" onclick="activate('email')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></span>Email Notification</button>
     </div>
     <div class="sidebar-back">
@@ -1234,9 +1264,7 @@ textarea{height:90px;resize:vertical}
         <p class="sub">AstroPaperDigest v{{ current_version }} — LLM-scored daily arXiv digests for your research interests.</p>
         <a href="https://github.com/jiangrz77/AstroPaperDigest" target="_blank" style="font-size:13px;color:#2563eb">GitHub Repository ↗</a>
       </div>
-    </section>
 
-    <section class="panel" id="panel-llm">
       <div class="card">
         <h2>LLM &amp; API</h2>
         <p class="sub">Configure the LLM provider used to score paper relevance.</p>
@@ -1263,24 +1291,27 @@ textarea{height:90px;resize:vertical}
     </section>
 
     <section class="panel" id="panel-interests">
-      <div class="card">
-        <h2>Research Interests</h2>
-        <p class="sub">Control which arXiv papers are fetched and how your profile is built.</p>
-        <form method="POST" action="/settings/save?section=interests" enctype="multipart/form-data">
+      <form method="POST" action="/settings/save?section=interests" enctype="multipart/form-data">
+        <div class="card">
+          <h2>Paper Categories</h2>
+          <p class="sub">Choose which arXiv categories are included in every daily digest.</p>
+          <div class="checkbox-grid">
+            <label><input type="checkbox" name="categories" value="astro-ph.GA" {% if 'astro-ph.GA' in cur_categories %}checked{% endif %}> astro-ph.GA</label>
+            <label><input type="checkbox" name="categories" value="astro-ph.SR" {% if 'astro-ph.SR' in cur_categories %}checked{% endif %}> astro-ph.SR</label>
+            <label><input type="checkbox" name="categories" value="astro-ph.HE" {% if 'astro-ph.HE' in cur_categories %}checked{% endif %}> astro-ph.HE</label>
+            <label><input type="checkbox" name="categories" value="astro-ph.CO" {% if 'astro-ph.CO' in cur_categories %}checked{% endif %}> astro-ph.CO</label>
+            <label><input type="checkbox" name="categories" value="astro-ph.IM" {% if 'astro-ph.IM' in cur_categories %}checked{% endif %}> astro-ph.IM</label>
+            <label><input type="checkbox" name="categories" value="astro-ph.EP" {% if 'astro-ph.EP' in cur_categories %}checked{% endif %}> astro-ph.EP</label>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Research Profile</h2>
+          <p class="sub">Choose how AstroPaperDigest builds your relevance profile.</p>
           <div class="toggle-group">
             <label><input type="radio" name="profile_mode" value="quick" {% if not cur_bib_file %}checked{% endif %} onchange="toggleProfileMode()"> Quick Start</label>
             <label><input type="radio" name="profile_mode" value="bib" {% if cur_bib_file %}checked{% endif %} onchange="toggleProfileMode()"> Use Bib File</label>
           </div>
           <div id="quick-mode" {% if cur_bib_file %}style="display:none"{% endif %}>
-            <label>Arxiv Categories</label>
-            <div class="checkbox-grid">
-              <label><input type="checkbox" name="categories" value="astro-ph.GA" {% if 'astro-ph.GA' in cur_categories %}checked{% endif %}> astro-ph.GA</label>
-              <label><input type="checkbox" name="categories" value="astro-ph.SR" {% if 'astro-ph.SR' in cur_categories %}checked{% endif %}> astro-ph.SR</label>
-              <label><input type="checkbox" name="categories" value="astro-ph.HE" {% if 'astro-ph.HE' in cur_categories %}checked{% endif %}> astro-ph.HE</label>
-              <label><input type="checkbox" name="categories" value="astro-ph.CO" {% if 'astro-ph.CO' in cur_categories %}checked{% endif %}> astro-ph.CO</label>
-              <label><input type="checkbox" name="categories" value="astro-ph.IM" {% if 'astro-ph.IM' in cur_categories %}checked{% endif %}> astro-ph.IM</label>
-              <label><input type="checkbox" name="categories" value="astro-ph.EP" {% if 'astro-ph.EP' in cur_categories %}checked{% endif %}> astro-ph.EP</label>
-            </div>
             <label for="keywords">Keywords (comma-separated)</label>
             <textarea id="keywords" name="keywords" placeholder="e.g. first stars, chemical evolution, supernova, stellar abundances">{{ cur_keywords or '' }}</textarea>
             <p class="hint">These help filter and rank papers relevant to your research.</p>
@@ -1295,7 +1326,16 @@ textarea{height:90px;resize:vertical}
           <div class="row">
             <button class="btn btn-primary" type="submit">Save Changes</button>
           </div>
-        </form>
+        </div>
+      </form>
+      <div class="card" id="learned-preferences">
+        <h2>Learned Preferences</h2>
+        <p class="sub">Learned from your Overrated / Underrated feedback; you can also adjust manually. Weight &gt; 1 = more relevant, &lt; 1 = less relevant, 1 = no effect.</p>
+        <p class="hint">Auto = learned from your feedback; Manual = your own value (takes priority over auto). Ignore = stop this item from affecting scores; Restore auto = drop the manual value and return to the learned result.</p>
+        <div id="learned-content">Loading…</div>
+        <div class="row">
+          <button class="btn btn-primary" type="button" id="btn-reset-learned" onclick="resetLearned()">Reset All</button>
+        </div>
       </div>
     </section>
 
@@ -1307,18 +1347,6 @@ textarea{height:90px;resize:vertical}
         <label class="check-line" style="margin-top:16px;color:#999;cursor:not-allowed">
           <input type="checkbox" disabled> Enable email notification
         </label>
-      </div>
-    </section>
-
-    <section class="panel" id="panel-learned">
-      <div class="card">
-        <h2>Learned Preferences</h2>
-        <p class="sub">Learned from your Overrated / Underrated feedback; you can also adjust manually. Weight &gt; 1 = more relevant, &lt; 1 = less relevant, 1 = no effect.</p>
-        <p class="hint">Auto = learned from your feedback; Manual = your own value (takes priority over auto). Ignore = stop this item from affecting scores; Restore auto = drop the manual value and return to the learned result.</p>
-        <div id="learned-content">Loading…</div>
-        <div class="row">
-          <button class="btn btn-primary" type="button" id="btn-reset-learned" onclick="resetLearned()">Reset All</button>
-        </div>
       </div>
     </section>
 
@@ -1348,7 +1376,7 @@ function toggleProfileMode() {
 </script>
 <script>
 (function () {
-  const SECTIONS = ["general", "llm", "interests", "learned", "email"];
+  const SECTIONS = ["general", "interests", "email"];
   function activate(name) {
     const requested = name;
     if (name === "update") name = "general";
@@ -1808,7 +1836,17 @@ function poll() {
   fetch('/status').then(r=>r.json()).then(d=>{
     renderStatus(d);
     if (d.status === 'done') {
-      setTimeout(function () { window.location.href = '/digest'; }, 900);
+      setTimeout(function () {
+        const summary = d.batch_summary;
+        const params = new URLSearchParams();
+        if (summary && Number.isFinite(summary.official_total) && Number.isFinite(summary.selected_total)) {
+          params.set('official_total', String(summary.official_total));
+          params.set('selected_total', String(summary.selected_total));
+          params.set('categories', summary.categories || '');
+        }
+        const query = params.toString();
+        window.location.href = '/digest/{{ display_date }}' + (query ? '?' + query : '');
+      }, 900);
     } else if (d.status === 'error') {
       // stay on this page; Retry / Back to Digest buttons are shown
     } else {
@@ -1843,6 +1881,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .btn-refresh{background:#3498db;color:#fff}.btn-refresh:hover{background:#2980b9}
 .btn-nav{background:#ecf0f1;color:#555}.btn-nav:hover{background:#dfe6e9}
 .btn-nav-active{background:#2c3e50;color:#fff}
+.scope-banner{display:none;align-items:center;gap:12px;padding:7px 32px;background:#eff6ff;border-bottom:1px solid #bfdbfe;color:#1e3a5f;font-size:12px;line-height:1.4}
+.scope-banner-text{min-width:0;flex:1}
+.scope-banner-actions{display:flex;align-items:center;gap:10px;white-space:nowrap;margin-left:auto;color:#476581}
+.scope-banner-close{border:none;background:transparent;color:#476581;font-size:18px;line-height:1;padding:0 2px;cursor:pointer}
+.scope-banner-close:hover{color:#0f3d69}
 .container{max-width:900px;margin:0 auto;padding:24px 16px}
 .tier-header{margin:28px 0 12px;padding-bottom:8px;border-bottom:2px solid #e0e0e0;scroll-margin-top:165px}
 .tier-header h2{font-size:18px}
@@ -1908,6 +1951,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <label><input type="checkbox" id="chk-repl" {% if prefs.include_replacements %}checked{% endif %}> Replacements</label>
   </div>
 </div>
+<div class="scope-banner" id="scope-banner" role="status" aria-live="polite">
+  <span class="scope-banner-text" id="scope-banner-text"></span>
+  <span class="scope-banner-actions">
+    <span id="scope-banner-countdown">Auto-closes in 5s</span>
+    <button class="scope-banner-close" id="scope-banner-close" type="button" aria-label="Close">&times;</button>
+  </span>
+</div>
 </div>
 <div class="container">
 {% for tier in digest.tiers %}
@@ -1939,6 +1989,48 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 <script>
 const DIGEST_DATE = {{ digest.date | tojson }};
+function showScopeBanner() {
+  const params = new URLSearchParams(window.location.search);
+  const official = Number(params.get('official_total'));
+  const selected = Number(params.get('selected_total'));
+  const categories = params.get('categories');
+  if (!Number.isFinite(official) || !Number.isFinite(selected) || official < 0 || selected < 0 || !categories) return;
+
+  const banner = document.getElementById('scope-banner');
+  const text = document.getElementById('scope-banner-text');
+  const countdown = document.getElementById('scope-banner-countdown');
+  const close = document.getElementById('scope-banner-close');
+  if (!banner || !text || !countdown || !close) return;
+
+  text.textContent = 'Official astro-ph batch: ' + official + ' papers · Processed for your selected categories: ' + selected + ' papers (' + categories + ')';
+  banner.style.display = 'flex';
+  let remaining = 5;
+  let timer = null;
+  function dismiss() {
+    if (timer) window.clearInterval(timer);
+    banner.style.display = 'none';
+  }
+  function updateCountdown() {
+    countdown.textContent = 'Auto-closes in ' + remaining + 's';
+  }
+  updateCountdown();
+  timer = window.setInterval(function () {
+    remaining -= 1;
+    if (remaining <= 0) {
+      dismiss();
+    } else {
+      updateCountdown();
+    }
+  }, 1000);
+  close.addEventListener('click', dismiss, {once: true});
+
+  params.delete('official_total');
+  params.delete('selected_total');
+  params.delete('categories');
+  const query = params.toString();
+  window.history.replaceState(null, '', window.location.pathname + (query ? '?' + query : '') + window.location.hash);
+}
+showScopeBanner();
 function giveFeedback(btn, action) {
   const id = btn.dataset.id, title = btn.dataset.title, score = btn.dataset.score;
   const wasActive = btn.classList.contains('active');
@@ -2507,6 +2599,7 @@ def status():
         "total": _pipeline_progress.get("total", 0),
         "elapsed": elapsed,
         "log": list(_pipeline_log)[-15:],
+        "batch_summary": _pipeline_batch_summary,
     })
 
 
