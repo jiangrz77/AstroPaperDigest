@@ -19,6 +19,7 @@ def parse_digest(digest_path: str) -> dict:
         "date": "",
         "total_papers": 0,
         "highly_relevant_count": 0,
+        "content": "",
         "tiers": [],
     }
     
@@ -38,6 +39,10 @@ def parse_digest(digest_path: str) -> dict:
     status_match = re.search(r"\*\*Status:\*\* (\w+)", content)
     if status_match:
         result["status"] = status_match.group(1)
+
+    content_match = re.search(r"\*\*Content:\*\* (\w+)", content)
+    if content_match:
+        result["content"] = content_match.group(1)
     
     # Split into tiers by ## headers
     tier_sections = re.split(r"^## ", content, flags=re.MULTILINE)

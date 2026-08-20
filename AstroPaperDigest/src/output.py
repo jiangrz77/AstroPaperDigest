@@ -132,11 +132,13 @@ def generate_markdown_digest(
         markdown string
     """
     d = digest_date or date.today().isoformat()
+    content_flag = "partial" if any(p.get("scoring_failed") for p in papers) else "full"
     lines = [
         f"# AstroPaperDigest - {d}",
         "",
         f"**Total papers reviewed:** {len(papers)}",
         f"**Highly relevant (score >= {threshold}):** {len([p for p in papers if p.get('score', 0) >= threshold])}",
+        f"**Content:** {content_flag}",
         "",
     ]
     

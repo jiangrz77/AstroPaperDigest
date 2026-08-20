@@ -90,6 +90,7 @@ def _write_empty_digest(digest_dir: str, reason: str, digest_date: str = None, n
 **Total papers reviewed:** 0
 **Highly relevant (score >= 7):** 0
 **Status:** {reason}
+**Content:** empty
 """
     if note:
         content += f"\n> Note: {note}\n"

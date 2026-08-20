@@ -788,6 +788,174 @@ def _start_pipeline(
 
 # --- HTML Templates ---
 
+_CALENDAR_SNIPPET = r"""<style>
+.btn-settings{display:inline-flex;align-items:center;justify-content:center;height:34px;width:34px;padding:0;box-sizing:border-box;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:6px;cursor:pointer;font-size:16px;line-height:1;transition:background .15s}
+.btn-settings:hover{background:rgba(255,255,255,.3)}
+.apd-cal{position:fixed;z-index:1000;background:#fff;color:#333;border-radius:12px;box-shadow:0 10px 34px rgba(0,0,0,.28),0 2px 8px rgba(0,0,0,.14);padding:14px;width:288px;font-size:13px;user-select:none}
+.apd-cal[hidden]{display:none}
+.cal-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.cal-title{font-weight:700;font-size:14px;color:#1a2332}
+.cal-nav{background:#f0f2f5;border:none;border-radius:6px;width:28px;height:28px;font-size:16px;cursor:pointer;color:#555;line-height:1}
+.cal-nav:hover{background:#dfe6e9}
+.cal-nav:disabled{opacity:.3;cursor:default}
+.cal-week,.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;text-align:center}
+.cal-week{color:#999;font-size:11px;margin-bottom:4px;font-weight:600}
+.cal-week span{padding:4px 0}
+.cal-day{border:none;background:transparent;border-radius:8px;padding:7px 0;font-size:13px;cursor:pointer;color:#333;position:relative}
+.cal-day:hover{background:#eef2ff}
+.cal-day:disabled{color:#ccc;cursor:default}
+.cal-day:disabled:hover{background:transparent}
+.cal-day.today{outline:1px solid #2563eb;outline-offset:-1px}
+.cal-day.selected{background:#2563eb;color:#fff;font-weight:700}
+.cal-day.selected:hover{background:#1d4ed8}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.cal-day .dot{position:absolute;left:50%;bottom:3px;transform:translateX(-50%);width:5px;height:5px}
+.cal-day.selected .dot{box-shadow:0 0 0 1.5px #fff}
+.dot-green{background:#27ae60}
+.dot-orange{background:#f39c12}
+.dot-gray{background:#cbd5e1}
+.cal-legend{display:flex;gap:12px;margin-top:10px;padding-top:10px;border-top:1px solid #eef0f3;font-size:11px;color:#777;flex-wrap:wrap}
+.cal-legend span{display:inline-flex;align-items:center;gap:5px}
+.cal-hint{font-size:11px;color:#aaa;margin-top:8px;text-align:center}
+</style>
+<script>
+(function () {
+  var STATUS = window.APD_DIGEST_STATUS || {};
+  var todayStr = '';
+  var selectedStr = '';
+  var viewY = 0, viewM = 0; // viewM is 0-based
+  var pop = null;
+  var label = document.getElementById('date-label');
+  var picker = document.getElementById('date-picker');
+  if (!label || !picker) return;
+
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function iso(y, m, d) { return y + '-' + pad(m + 1) + '-' + pad(d); }
+
+  todayStr = picker.max || (function () {
+    var n = new Date();
+    return iso(n.getFullYear(), n.getMonth(), n.getDate());
+  })();
+  selectedStr = /^\d{4}-\d{2}-\d{2}$/.test(picker.value) ? picker.value : todayStr;
+
+  var parts = selectedStr.split('-');
+  viewY = parseInt(parts[0], 10);
+  viewM = parseInt(parts[1], 10) - 1;
+
+
+  function build() {
+    pop = document.createElement('div');
+    pop.className = 'apd-cal';
+    pop.id = 'apd-cal';
+    pop.hidden = true;
+    pop.innerHTML =
+      '<div class="cal-head">' +
+        '<button type="button" class="cal-nav" id="cal-prev" title="Previous month">‹</button>' +
+        '<span class="cal-title" id="cal-title"></span>' +
+        '<button type="button" class="cal-nav" id="cal-next" title="Next month">›</button>' +
+      '</div>' +
+      '<div class="cal-week"><span>Mo</span><span>Tu</span><span>We</span><span>Th</span><span>Fr</span><span>Sa</span><span>Su</span></div>' +
+      '<div class="cal-grid" id="cal-grid"></div>' +
+      '<div class="cal-legend">' +
+        '<span><i class="dot dot-green"></i>Has content</span>' +
+        '<span><i class="dot dot-orange"></i>Some unscored</span>' +
+        '<span><i class="dot dot-gray"></i>Empty digest</span>' +
+      '</div>' +
+      '<div class="cal-hint">Click a date to open it · click outside or press Esc to close</div>';
+    document.body.appendChild(pop);
+    pop.addEventListener('click', function (e) { e.stopPropagation(); });
+    document.getElementById('cal-prev').addEventListener('click', function () {
+      viewM--;
+      if (viewM < 0) { viewM = 11; viewY--; }
+      render();
+    });
+    document.getElementById('cal-next').addEventListener('click', function () {
+      viewM++;
+      if (viewM > 11) { viewM = 0; viewY++; }
+      render();
+    });
+    document.getElementById('cal-grid').addEventListener('click', function (e) {
+      var target = e.target;
+      var btn = target && target.closest ? target.closest('.cal-day') : null;
+      if (!btn || btn.disabled) return;
+      var d = btn.getAttribute('data-date');
+      if (d && window.navigateToDate) window.navigateToDate(d);
+      close();
+    });
+  }
+
+  function render() {
+    document.getElementById('cal-title').textContent =
+      new Date(viewY, viewM, 1).toLocaleDateString('en-US', {month: 'long', year: 'numeric'});
+    var tp = todayStr.split('-');
+    var ty = parseInt(tp[0], 10), tm = parseInt(tp[1], 10) - 1;
+    document.getElementById('cal-next').disabled = (viewY > ty) || (viewY === ty && viewM >= tm);
+
+    var first = new Date(viewY, viewM, 1);
+    var offset = (first.getDay() + 6) % 7; // Monday-first week
+    var daysInMonth = new Date(viewY, viewM + 1, 0).getDate();
+    var html = '';
+    for (var i = 0; i < offset; i++) html += '<span></span>';
+    for (var d = 1; d <= daysInMonth; d++) {
+      var dateStr = iso(viewY, viewM, d);
+      var cls = 'cal-day';
+      if (dateStr === todayStr) cls += ' today';
+      if (dateStr === selectedStr) cls += ' selected';
+      var disabled = dateStr > todayStr ? ' disabled' : '';
+      var dot = STATUS[dateStr] ? '<i class="dot dot-' + STATUS[dateStr] + '"></i>' : '';
+      html += '<button type="button" class="' + cls + '" data-date="' + dateStr + '"' + disabled + '>' + d + dot + '</button>';
+    }
+    document.getElementById('cal-grid').innerHTML = html;
+  }
+
+  function position() {
+    var r = label.getBoundingClientRect();
+    var left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8));
+    var top = r.bottom + 8;
+    if (top + pop.offsetHeight > window.innerHeight - 8) {
+      top = Math.max(8, r.top - pop.offsetHeight - 8);
+    }
+    pop.style.left = left + 'px';
+    pop.style.top = top + 'px';
+  }
+
+  function open() {
+    pop.hidden = false; // unhide first so offsetWidth/Height are measurable
+    render();
+    position();
+  }
+  function close() { pop.hidden = true; }
+
+  // Override the native date-picker trigger used by the page templates.
+  window.openDatePicker = function () {
+    if (pop.hidden) { open(); } else { close(); }
+  };
+
+  document.addEventListener('mousedown', function (e) {
+    if (pop.hidden) return;
+    if (!pop.contains(e.target) && e.target !== label && !label.contains(e.target)) close();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && !pop.hidden) { e.preventDefault(); close(); }
+  });
+  window.addEventListener('resize', close);
+  window.addEventListener('scroll', function () { if (!pop.hidden) position(); }, true);
+
+  build();
+})();
+</script>
+<script>
+// macOS convention: Cmd+, (Ctrl+, on other platforms) opens Settings.
+document.addEventListener('keydown', function (e) {
+  if ((e.metaKey || e.ctrlKey) && e.key === ',') {
+    e.preventDefault();
+    if (window.location.pathname !== '/settings') window.location.href = '/settings';
+  }
+});
+</script>
+"""
+
+
 SETUP_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -944,14 +1112,16 @@ SETTINGS_TEMPLATE = """<!DOCTYPE html>
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333}
 .header{background:#1a2332;color:#fff;padding:16px 32px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
 .header h1{font-size:20px;margin:0}
-.header .back-link{display:inline-flex;align-items:center;gap:8px;background:#fff;color:#1a2332;text-decoration:none;font-size:14px;font-weight:700;padding:9px 16px;border-radius:999px;box-shadow:0 2px 10px rgba(0,0,0,.25);transition:transform .15s,box-shadow .15s}
-.header .back-link:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.35);color:#1a2332}
+.back-link{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:10px 12px;border-radius:8px;background:#f8fafc;border:1px solid #d1d5db;color:#1a2332;text-decoration:none;font-size:14px;font-weight:600;transition:background .15s,border-color .15s}
+.back-link:hover{background:#eef2f7;border-color:#9ca3af;color:#1a2332}
 .layout{display:flex;align-items:flex-start;max-width:1100px;margin:0 auto;padding:24px 16px;gap:24px}
-.sidebar{width:220px;flex-shrink:0;background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.08);padding:8px;position:sticky;top:24px}
+.sidebar{width:220px;flex-shrink:0;background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.08);padding:10px;position:sticky;top:24px}
+.sidebar-back{margin-top:12px;padding-top:14px;border-top:1px solid #e5e7eb}
 .nav-item{display:flex;align-items:center;gap:10px;width:100%;padding:10px 14px;border:none;border-radius:8px;background:transparent;font-size:14px;color:#444;cursor:pointer;text-align:left}
 .nav-item:hover{background:#f0f2f5}
 .nav-item.active{background:#2563eb;color:#fff;font-weight:600}
-.nav-icon{font-size:16px;width:22px;text-align:center}
+.nav-icon{width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+.nav-icon svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .content{flex:1;min-width:0}
 .panel{display:none}
 .panel.active{display:block}
@@ -1002,15 +1172,19 @@ textarea{height:90px;resize:vertical}
 <body>
 <div class="header">
   <h1>AstroPaperDigest - Settings</h1>
-  <a class="back-link" href="/">← Back to Digest</a>
 </div>
 <div class="layout">
   <nav class="sidebar">
-    <button class="nav-item active" data-section="general" onclick="activate('general')"><span class="nav-icon">⚙️</span>General</button>
-    <button class="nav-item" data-section="llm" onclick="activate('llm')"><span class="nav-icon">🤖</span>LLM &amp; API</button>
-    <button class="nav-item" data-section="interests" onclick="activate('interests')"><span class="nav-icon">📚</span>Research Interests</button>
-    <button class="nav-item" data-section="learned" onclick="activate('learned')"><span class="nav-icon">🎯</span>Learned Preferences</button>
-    <button class="nav-item" data-section="email" onclick="activate('email')"><span class="nav-icon">✉️</span>Email Notification</button>
+    <div class="sidebar-nav">
+      <button class="nav-item active" data-section="general" onclick="activate('general')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>General</button>
+      <button class="nav-item" data-section="llm" onclick="activate('llm')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/></svg></span>LLM &amp; API</button>
+      <button class="nav-item" data-section="interests" onclick="activate('interests')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></span>Research Interests</button>
+      <button class="nav-item" data-section="learned" onclick="activate('learned')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg></span>Learned Preferences</button>
+      <button class="nav-item" data-section="email" onclick="activate('email')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></span>Email Notification</button>
+    </div>
+    <div class="sidebar-back">
+      <a class="back-link" href="/">← Back to Digest</a>
+    </div>
   </nav>
   <main class="content">
 
@@ -1428,13 +1602,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .header h1{font-size:22px;margin-bottom:4px}
 .header .stats{color:#8899aa;font-size:14px}
 .sticky-wrapper{position:sticky;top:0;z-index:100;box-shadow:0 2px 8px rgba(0,0,0,.15)}
-.toolbar{background:#fff;padding:10px 32px;border-bottom:1px solid #e0e0e0;display:flex;gap:10px;align-items:center;flex-wrap:nowrap;overflow-x:auto}
-.toolbar button{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500}
+.toolbar{background:#fff;padding:10px 32px;border-bottom:1px solid #e0e0e0;display:flex;gap:10px;align-items:center;flex-wrap:wrap;row-gap:8px;overflow-x:visible}
+.toolbar button{height:36px;padding:0 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;display:inline-flex;align-items:center;justify-content:center;line-height:1;box-sizing:border-box}
 .btn-refresh{background:#3498db;color:#fff}.btn-refresh:hover{background:#2980b9}
 .btn-nav{background:#ecf0f1;color:#555}.btn-nav:hover{background:#dfe6e9}
-.date-display{font-size:16px;font-weight:600;color:#fff;cursor:default;padding:4px 12px;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2)}
-.date-arrow{background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:default;font-size:15px;line-height:1;opacity:.5}
-.btn-today{background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px;font-weight:600}
+.date-display{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;font-size:16px;font-weight:600;color:#fff;cursor:default;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);line-height:1}
+.date-arrow{display:inline-flex;align-items:center;justify-content:center;height:34px;width:34px;padding:0;box-sizing:border-box;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;cursor:default;font-size:15px;line-height:1;opacity:.5}
+.btn-today{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;line-height:1}
 .btn-today:hover{background:rgba(255,255,255,.3)}
 .loading-area{text-align:center;padding:70px 20px;color:#999}
 .stage-label{font-size:19px;font-weight:700;color:#2c3e50;margin-bottom:12px}
@@ -1465,6 +1639,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
       <button class="date-arrow" id="arrow-right" onclick="shiftDate(1)" style="cursor:pointer;opacity:1">&rarr;</button>
       <button class="btn-today" onclick="goToToday()">Today</button>
       <input type="date" id="date-picker" value="{{ display_date }}" max="{{ today_str }}" onchange="navigateToDate(this.value)" style="position:absolute;opacity:0;pointer-events:none;width:0;height:0">
+      <span style="width:1px;height:22px;background:rgba(255,255,255,.25);margin:0 6px"></span>
+      <button class="btn-settings" onclick="location.href='/settings'" title="Settings (⌘,)" aria-label="Settings">&#x2699;</button>
     </div>
   </div>
 </div>
@@ -1635,6 +1811,10 @@ function poll() {
 }
 poll();
 </script>
+<script>
+window.APD_DIGEST_STATUS = {{ digest_status_map() | tojson }};
+</script>
+{{ calendar_snippet | safe }}
 </body>
 </html>"""
 
@@ -1651,8 +1831,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .header h1{font-size:22px;margin-bottom:4px}
 .header .stats{color:#8899aa;font-size:14px}
 .sticky-wrapper{position:sticky;top:0;z-index:100;box-shadow:0 2px 8px rgba(0,0,0,.15)}
-.toolbar{background:#fff;padding:10px 32px;border-bottom:1px solid #e0e0e0;display:flex;gap:10px;align-items:center;flex-wrap:nowrap;overflow-x:auto}
-.toolbar button{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500}
+.toolbar{background:#fff;padding:10px 32px;border-bottom:1px solid #e0e0e0;display:flex;gap:10px;align-items:center;flex-wrap:wrap;row-gap:8px;overflow-x:visible}
+.toolbar button{height:36px;padding:0 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;display:inline-flex;align-items:center;justify-content:center;line-height:1;box-sizing:border-box}
 .btn-refresh{background:#3498db;color:#fff}.btn-refresh:hover{background:#2980b9}
 .btn-nav{background:#ecf0f1;color:#555}.btn-nav:hover{background:#dfe6e9}
 .btn-nav-active{background:#2c3e50;color:#fff}
@@ -1681,13 +1861,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .fb-overrated{color:#e74c3c}.fb-overrated:hover,.fb-overrated.active{background:#e74c3c;color:#fff;border-color:#e74c3c}
 .fb-underrated{color:#27ae60}.fb-underrated:hover,.fb-underrated.active{background:#27ae60;color:#fff;border-color:#27ae60}
 .checkbox-group{display:flex;gap:15px;align-items:center;margin-left:auto;font-size:13px}
-.checkbox-group label{display:flex;align-items:center;gap:5px;cursor:pointer;color:#555}
+.checkbox-group label{display:inline-flex;align-items:center;gap:5px;height:36px;cursor:pointer;color:#555}
 .checkbox-group input[type="checkbox"]{cursor:pointer;width:16px;height:16px}
-.date-display{font-size:16px;font-weight:600;color:#fff;cursor:pointer;padding:4px 12px;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);user-select:none}
+.date-display{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;font-size:16px;font-weight:600;color:#fff;cursor:pointer;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);line-height:1;user-select:none}
 .date-display:hover{background:rgba(255,255,255,.2)}
-.date-arrow{background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:15px;line-height:1}
+.date-arrow{display:inline-flex;align-items:center;justify-content:center;height:34px;width:34px;padding:0;box-sizing:border-box;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:15px;line-height:1}
 .date-arrow:hover{background:rgba(255,255,255,.25)}
-.btn-today{background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px;font-weight:600}
+.btn-today{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;line-height:1}
 .btn-today:hover{background:rgba(255,255,255,.3)}
 .loading-overlay{text-align:center;padding:80px 20px;color:#999}
 .loading-overlay .spinner{width:40px;height:40px;border:3px solid #e0e0e0;border-top-color:#3498db;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 20px}
@@ -1705,12 +1885,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
       <button class="date-arrow" id="arrow-right" onclick="shiftDate(1)">&rarr;</button>
       <button class="btn-today" onclick="goToToday()">Today</button>
       <input type="date" id="date-picker" value="{{ digest.date }}" max="{{ today_str }}" onchange="navigateToDate(this.value)" style="position:absolute;opacity:0;pointer-events:none;width:0;height:0">
+      <span style="width:1px;height:22px;background:rgba(255,255,255,.25);margin:0 6px"></span>
+      <button class="btn-settings" onclick="location.href='/settings'" title="Settings (⌘,)" aria-label="Settings">&#x2699;</button>
     </div>
   </div>
 </div>
 <div class="toolbar">
   <button class="btn-refresh" onclick="rerunWithPrefs()" title="Re-run pipeline" style="font-size:18px">&#x21bb;</button>
-  <button class="btn-nav" onclick="location.href='/settings'" title="Settings" style="font-size:18px">&#x2699;</button>
   <span class="stats" style="font-size:13px;color:#666">Total: {{ digest.total_papers }} papers &nbsp;|&nbsp; Highly relevant: {{ digest.highly_relevant_count }}</span>
   {% for tier in digest.tiers %}
   <button class="btn-nav" data-tier-idx="{{ loop.index0 }}" onclick="document.getElementById('tier-{{ loop.index }}').scrollIntoView({behavior:'smooth'})">{{ tier.name }} (<span class="btn-tier-count">{{ tier.papers|length }}</span>)</button>
@@ -1774,6 +1955,7 @@ fetch('/feedback').then(r=>r.json()).then(list=>{
 });
 
 function rerunWithPrefs() {
+  if (!confirm('Re-run the pipeline for this date? This will regenerate the digest and may consume LLM API credits.')) return;
   const includeCross = document.getElementById('chk-cross').checked;
   const includeRepl = document.getElementById('chk-repl').checked;
   const picker = document.getElementById('date-picker');
@@ -1860,6 +2042,16 @@ function onCheckboxChange() {
   filterCards();
 }
 
+function countVisibleBetween(tier, nextTier) {
+  let count = 0;
+  let el = tier.nextElementSibling;
+  while (el && el !== nextTier) {
+    if (el.classList.contains('card') && el.style.display !== 'none') count++;
+    el = el.nextElementSibling;
+  }
+  return count;
+}
+
 function filterCards() {
   const includeCross = document.getElementById('chk-cross').checked;
   const includeRepl = document.getElementById('chk-repl').checked;
@@ -1882,14 +2074,7 @@ function filterCards() {
   const tierHeaders = document.querySelectorAll('.tier-header');
   tierHeaders.forEach((tier, idx) => {
     const nextTier = tierHeaders[idx + 1];
-    let visibleCount = 0;
-    let el = tier.nextElementSibling;
-    while (el && el !== nextTier) {
-      if (el.classList.contains('card') && el.style.display !== 'none') {
-        visibleCount++;
-      }
-      el = el.nextElementSibling;
-    }
+    const visibleCount = countVisibleBetween(tier, nextTier);
     const countEl = tier.querySelector('.tier-count');
     if (countEl) countEl.textContent = visibleCount;
     // Also update toolbar button count
@@ -1897,11 +2082,13 @@ function filterCards() {
     if (btnCount) btnCount.textContent = visibleCount;
   });
   
-  // Update total in header
+  // Update total + highly-relevant stat from the visible tier counts, so the
+  // header numbers stay consistent with the filtered cards.
   const statsEl = document.querySelector('.stats');
   if (statsEl) {
-    const highlyRelevant = {{ digest.highly_relevant_count }};
-    statsEl.innerHTML = `Total: ${totalVisible} papers &nbsp;|&nbsp; Highly relevant: ${highlyRelevant}`;
+    const firstTier = tierHeaders[0];
+    const visibleHighly = firstTier ? countVisibleBetween(firstTier, tierHeaders[1] || null) : 0;
+    statsEl.innerHTML = `Total: ${totalVisible} papers &nbsp;|&nbsp; Highly relevant: ${visibleHighly}`;
   }
 }
 </script>
@@ -1909,6 +2096,10 @@ function filterCards() {
 // Apply initial filter on page load
 filterCards();
 </script>
+<script>
+window.APD_DIGEST_STATUS = {{ digest_status_map() | tojson }};
+</script>
+{{ calendar_snippet | safe }}
 </body>
 </html>"""
 
@@ -1925,19 +2116,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .header h1{font-size:22px;margin-bottom:4px}
 .header .stats{color:#8899aa;font-size:14px}
 .sticky-wrapper{position:sticky;top:0;z-index:100;box-shadow:0 2px 8px rgba(0,0,0,.15)}
-.toolbar{background:#fff;padding:10px 32px;border-bottom:1px solid #e0e0e0;display:flex;gap:10px;align-items:center;flex-wrap:nowrap;overflow-x:auto}
-.toolbar button{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500}
+.toolbar{background:#fff;padding:10px 32px;border-bottom:1px solid #e0e0e0;display:flex;gap:10px;align-items:center;flex-wrap:wrap;row-gap:8px;overflow-x:visible}
+.toolbar button{height:36px;padding:0 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;display:inline-flex;align-items:center;justify-content:center;line-height:1;box-sizing:border-box}
 .btn-refresh{background:#3498db;color:#fff}.btn-refresh:hover{background:#2980b9}
 .btn-nav{background:#ecf0f1;color:#555}.btn-nav:hover{background:#dfe6e9}
 .no-data{text-align:center;padding:80px 20px;color:#999}
 .no-data h2{font-size:20px;color:#666;margin-bottom:12px}
 .no-data p{font-size:14px;margin-bottom:24px}
 .no-data a{color:#3498db;text-decoration:none}
-.date-display{font-size:16px;font-weight:600;color:#fff;cursor:pointer;padding:4px 12px;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);user-select:none}
+.date-display{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;font-size:16px;font-weight:600;color:#fff;cursor:pointer;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);line-height:1;user-select:none}
 .date-display:hover{background:rgba(255,255,255,.2)}
-.date-arrow{background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:15px;line-height:1}
+.date-arrow{display:inline-flex;align-items:center;justify-content:center;height:34px;width:34px;padding:0;box-sizing:border-box;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:15px;line-height:1}
 .date-arrow:hover{background:rgba(255,255,255,.25)}
-.btn-today{background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px;font-weight:600}
+.btn-today{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;line-height:1}
 .btn-today:hover{background:rgba(255,255,255,.3)}
 </style>
 </head>
@@ -1952,11 +2143,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
       <button class="date-arrow" id="arrow-right" onclick="shiftDate(1)">&rarr;</button>
       <button class="btn-today" onclick="goToToday()">Today</button>
       <input type="date" id="date-picker" value="{{ selected_date }}" max="{{ today_str }}" onchange="navigateToDate(this.value)" style="position:absolute;opacity:0;pointer-events:none;width:0;height:0">
+      <span style="width:1px;height:22px;background:rgba(255,255,255,.25);margin:0 6px"></span>
+      <button class="btn-settings" onclick="location.href='/settings'" title="Settings (⌘,)" aria-label="Settings">&#x2699;</button>
     </div>
   </div>
 </div>
 <div class="toolbar">
-  <button class="btn-refresh" onclick="location.href='/run?date={{ selected_date }}'" title="Re-run pipeline">&#x21bb;</button>
+  <button class="btn-refresh" onclick="if(!confirm('Run the pipeline for this date? This may consume LLM API credits.'))return;location.href='/run?date={{ selected_date }}'" title="Re-run pipeline">&#x21bb;</button>
   <span style="font-size:13px;color:#666">No data available</span>
 </div>
 </div>
@@ -2014,6 +2207,10 @@ function goToToday() {
   navigateToDate(y + '-' + m + '-' + d);
 }
 </script>
+<script>
+window.APD_DIGEST_STATUS = {{ digest_status_map() | tojson }};
+</script>
+{{ calendar_snippet | safe }}
 </body>
 </html>"""
 
@@ -2050,6 +2247,49 @@ def _is_arxiv_update_day(date_str: str) -> bool:
     if date_str in _ARXIV_HOLIDAYS_2026:
         return False
     return True
+
+
+def _digest_status_map() -> dict:
+    """Map date -> 'green' | 'orange' | 'gray' for dates that have a digest file.
+
+    green  = digest has content (all papers scored)
+    orange = digest has content but some papers have no score
+    gray   = digest exists but has no content (empty digest)
+
+    Uses the **Content:** tag written by the pipeline when present (fast,
+    header-only classification), and falls back to a quick scan for older
+    digest files that predate the tag.  Never runs the pipeline.
+    """
+    result = {}
+    for date_str in get_available_dates():
+        path = get_digest_path_for_date(date_str)
+        if not path:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            continue
+        tag = re.search(r"\*\*Content:\*\* (\w+)", content)
+        if tag:
+            result[date_str] = {"empty": "gray", "partial": "orange", "full": "green"}.get(tag.group(1), "green")
+            continue
+        # Fallback for older digest files without the tag
+        if re.search(r"\*\*Status:\*\* \w+", content):
+            result[date_str] = "gray"
+        elif re.search(r"\*\*Total papers reviewed:\*\* 0\b", content):
+            result[date_str] = "gray"
+        elif re.search(r"\*\*Score:\*\* No score", content):
+            result[date_str] = "orange"
+        else:
+            result[date_str] = "green"
+    return result
+
+
+# Shared UI assets for the calendar popover and settings entry, exposed to
+# every template via Jinja globals so no route needs to pass them explicitly.
+app.jinja_env.globals["calendar_snippet"] = _CALENDAR_SNIPPET
+app.jinja_env.globals["digest_status_map"] = _digest_status_map
 
 
 def _render_digest(digest=None):
