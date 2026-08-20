@@ -30,6 +30,8 @@ jobs:
         run: ./release.sh
 
       - name: Generate release notes with SHA-256 checksums
+        env:
+          GH_TOKEN: ${{ github.token }}   # gh does not read GITHUB_TOKEN automatically
         run: |
           # Read the annotated tag message via the GitHub API (robust on any
           # runner; git tag -l %(contents) behaved differently in CI).
