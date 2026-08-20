@@ -121,22 +121,22 @@ def build_ranking_prompt(profile_text: str, papers: list[dict], learned_profile:
 {papers_text}
 
 === Task ===
-You are an astrophysics research assistant. For each candidate paper above, score its relevance to the researcher's interests on a scale of 0-10, where:
-- 9-10: Directly matches core research interests (chemical enrichment, metal-poor stars, globular clusters, supernovae, Population III stars, Milky Way formation, stellar abundances)
-- 7-8: Closely related to main interests
-- 5-6: Somewhat related, tangential topic
-- 3-4: Weakly related
-- 0-2: Not relevant
+You are an astrophysics research assistant. For each candidate paper above, rate its relevance to the researcher's interests on a scale of 1-5 stars, where:
+- 5 stars: Strongly recommended; directly matches core research interests (chemical enrichment, metal-poor stars, globular clusters, supernovae, Population III stars, Milky Way formation, stellar abundances)
+- 4 stars: Highly relevant; closely related to the main interests
+- 3 stars: Possibly relevant; meaningfully related or a useful adjacent topic
+- 2 stars: Possibly relevant; weakly or tangentially related
+- 1 star: Marginal; not meaningfully relevant
 
 For each paper, provide:
 1. The paper index [i]
-2. A relevance score (integer 0-10)
+2. A relevance rating (integer 1-5)
 3. A brief reason of no more than 12 words explaining the score
 
 Respond ONLY with a valid JSON array in this exact format, no other text:
 [
-  {{"index": 0, "score": 8, "reason": "Directly studies chemical enrichment in metal-poor globular clusters"}},
-  {{"index": 1, "score": 3, "reason": "Tangentially related through galaxy formation topic"}},
+  {{"index": 0, "score": 5, "reason": "Directly studies chemical enrichment in metal-poor globular clusters"}},
+  {{"index": 1, "score": 2, "reason": "Tangentially related through galaxy formation topic"}},
   ...
 ]
 """
@@ -195,7 +195,7 @@ def _parse_score_response(content: str) -> tuple[list[dict], bool]:
         if not isinstance(item, dict):
             continue
         try:
-            score = max(0, min(10, int(item.get("score", 5))))
+            score = max(1, min(5, int(item.get("score", 3))))
             items.append({
                 "index": int(item.get("index", -1)),
                 "score": score,

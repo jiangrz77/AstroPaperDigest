@@ -5,6 +5,8 @@ import os
 import re
 from datetime import date
 
+from .scoring import normalize_threshold
+
 
 def _escape_bibtex(text: str) -> str:
     """Escape special BibTeX characters outside of TeX math mode."""
@@ -42,7 +44,7 @@ def paper_to_bibtex(paper: dict) -> str:
     if scoring_failed:
         note_text = "No score (scoring failed)"
     else:
-        note_text = f"Recommended: score {paper.get('score', 'N/A')}/10 - {reason}"
+        note_text = f"Recommended: {paper.get('score', 'N/A')}/5 stars - {reason}"
     
     bibtex = f"""@misc{{{entry_key},
   title = {{{{{title}}}}},
@@ -64,7 +66,7 @@ def paper_to_bibtex(paper: dict) -> str:
 def write_bibtex(
     papers: list[dict],
     output_dir: str,
-    threshold: int = 7,
+    threshold: int = 4,
     output_date: str = None,
 ) -> str:
     """Write BibTeX entries for papers above the score threshold.
@@ -80,6 +82,7 @@ def write_bibtex(
     Returns:
         path to the written file
     """
+    threshold = normalize_threshold(threshold)
     filtered = [p for p in papers if p.get("score", 0) >= threshold]
     
     if not filtered:
@@ -119,32 +122,42 @@ def write_bibtex(
 
 def generate_markdown_digest(
     papers: list[dict],
-    threshold: int = 7,
+    threshold: int = 4,
     digest_date: str = None,
 ) -> str:
     """Generate a markdown digest of ranked papers.
     
     Args:
         papers: ranked list of paper dicts with 'score' and 'reason' fields
-        threshold: minimum score for 'Highly Relevant' tier
+        threshold: minimum star rating for BibTeX/high-relevance reporting
         digest_date: date string (YYYY-MM-DD) for the digest header
 
     Returns:
         markdown string
     """
+    threshold = normalize_threshold(threshold)
     d = digest_date or date.today().isoformat()
     content_flag = "partial" if any(p.get("scoring_failed") for p in papers) else "full"
     lines = [
         f"# AstroPaperDigest - {d}",
         "",
         f"**Total papers reviewed:** {len(papers)}",
-        f"**Highly relevant (score >= {threshold}):** {len([p for p in papers if p.get('score', 0) >= threshold])}",
+        f"**Highly relevant (4–5 stars):** {len([p for p in papers if p.get('score', 0) >= 4])}",
         f"**Content:** {content_flag}",
         "",
     ]
     
-    # Tier 1: Highly Relevant (score >= threshold)
-    high = [p for p in papers if p.get("score", 0) >= threshold]
+    # Tier 1: the highest recommendation is intentionally distinct from 4★.
+    strong = [p for p in papers if p.get("score", 0) == 5]
+    if strong:
+        lines.append("## Strongly Recommended")
+        lines.append("")
+        for p in strong:
+            lines.extend(_paper_to_markdown_entry(p))
+        lines.append("")
+
+    # Tier 2: Highly Relevant (4★)
+    high = [p for p in papers if p.get("score", 0) == 4]
     if high:
         lines.append("## Highly Relevant")
         lines.append("")
@@ -152,8 +165,8 @@ def generate_markdown_digest(
             lines.extend(_paper_to_markdown_entry(p))
         lines.append("")
     
-    # Tier 2: Possibly Relevant (score 5 to threshold-1)
-    medium = [p for p in papers if 5 <= p.get("score", 0) < threshold]
+    # Tier 3: Possibly Relevant (2–3★)
+    medium = [p for p in papers if 2 <= p.get("score", 0) <= 3]
     if medium:
         lines.append("## Possibly Relevant")
         lines.append("")
@@ -161,8 +174,8 @@ def generate_markdown_digest(
             lines.extend(_paper_to_markdown_entry(p))
         lines.append("")
     
-    # Tier 3: Marginal (score < 5)
-    low = [p for p in papers if p.get("score", 0) < 5]
+    # Tier 4: Marginal (1★); failed scoring remains visible here as No score.
+    low = [p for p in papers if p.get("score", 0) <= 1]
     if low:
         lines.append("## Marginal")
         lines.append("")
@@ -198,7 +211,7 @@ def _paper_to_markdown_entry(paper: dict, brief: bool = False) -> list[str]:
     if paper.get("scoring_failed"):
         lines.append(f"**Score:** No score | **Reason:** {reason}")
     else:
-        lines.append(f"**Score:** {score}/10 | **Reason:** {reason}")
+        lines.append(f"**Score:** {score}/5 | **Reason:** {reason}")
         adjustment = paper.get("score_adjustment", 0)
         if adjustment:
             lines.append(f"**Adjustment:** {adjustment:+.1f}")
@@ -221,7 +234,7 @@ def _paper_to_markdown_entry(paper: dict, brief: bool = False) -> list[str]:
 def write_digest(
     papers: list[dict],
     digest_dir: str,
-    threshold: int = 7,
+    threshold: int = 4,
     digest_date: str = None,
 ) -> str:
     """Write markdown digest to file.

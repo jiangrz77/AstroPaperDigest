@@ -4,6 +4,7 @@ import json
 import os
 
 from src import paths as _paths
+from src.scoring import TIER_NAMES, apply_source_adjustment, score_to_stars, tier_key
 
 _ADJUSTMENTS_FILE = os.path.join(str(_paths.data_dir()), "feedback_adjustments.json")
 
@@ -31,7 +32,10 @@ def record_adjustment(date_str: str, paper_id: str, amount: int,
     data = load_adjustments(path)
     dates = data.setdefault(date_str, {})
     current = int(dates.get(paper_id, 0))
-    current += 1 if amount > 0 else -1
+    step = int(amount)
+    if step == 0:
+        return current
+    current += step
     # The effective score is clamped later against the paper's base score;
     # retaining the signed count means future feedback remains cumulative.
     dates[paper_id] = current
@@ -56,25 +60,30 @@ def clear_date(date_str: str, path: str = _ADJUSTMENTS_FILE) -> None:
 
 def apply_to_digest(digest: dict, date_str: str,
                    path: str = _ADJUSTMENTS_FILE) -> dict:
-    """Apply saved adjustments and rebuild the three score tiers in place."""
+    """Apply saved adjustments and rebuild the four star-rating tiers in place."""
     adjustments = load_adjustments(path).get(date_str, {})
     papers = []
     for tier in digest.get("tiers", []):
         for paper in tier.get("papers", []):
-            base_score = int(paper.get("score", 0) or 0)
+            displayed_score = int(paper.get("score", 0) or 0)
+            scale = int(paper.get("score_scale", 10 if displayed_score > 5 else 5) or 5)
+            source_score = int(paper.get("score_source", displayed_score) or 0)
+            base_score = 0 if paper.get("scoring_failed") else score_to_stars(source_score, scale)
             paper["base_score"] = base_score
+            paper["score_scale"] = scale
+            paper["score_source"] = source_score
             delta = int(adjustments.get(paper.get("paper_id", ""), 0) or 0)
-            paper["score"] = max(0, min(10, base_score + delta))
+            paper["score"] = 0 if paper.get("scoring_failed") else apply_source_adjustment(source_score, delta, scale)
             papers.append(paper)
 
     papers.sort(key=lambda item: item.get("score", 0), reverse=True)
-    high = [p for p in papers if p.get("score", 0) >= 7]
-    medium = [p for p in papers if 5 <= p.get("score", 0) < 7]
-    low = [p for p in papers if p.get("score", 0) < 5]
+    grouped = {key: [] for key in ("strong", "high", "medium", "low")}
+    for paper in papers:
+        key = "low" if paper.get("scoring_failed") else tier_key(paper.get("score", 1))
+        grouped[key].append(paper)
     digest["tiers"] = [
-        {"name": "Highly Relevant", "papers": high},
-        {"name": "Possibly Relevant", "papers": medium},
-        {"name": "Marginal", "papers": low},
+        {"name": TIER_NAMES[key], "papers": grouped[key]}
+        for key in ("strong", "high", "medium", "low")
     ]
-    digest["highly_relevant_count"] = len(high)
+    digest["highly_relevant_count"] = len(grouped["strong"]) + len(grouped["high"])
     return digest

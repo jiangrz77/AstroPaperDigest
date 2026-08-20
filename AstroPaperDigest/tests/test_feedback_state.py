@@ -29,13 +29,14 @@ class FeedbackStateTests(unittest.TestCase):
             apply_to_digest(digest, "2026-08-21", path)
             self.assertEqual(
                 [(p["paper_id"], p["score"]) for t in digest["tiers"] for p in t["papers"]],
-                [("b", 7), ("a", 5)],
+                [("b", 4), ("a", 3)],
             )
 
             clear_date("2026-08-21", path)
             digest = {"tiers": [{"name": "Highly Relevant", "papers": [{"paper_id": "a", "score": 7}]}]}
             apply_to_digest(digest, "2026-08-21", path)
-            self.assertEqual(digest["tiers"][0]["papers"][0]["score"], 7)
+            papers = [p for tier in digest["tiers"] for p in tier["papers"]]
+            self.assertEqual(papers[0]["score"], 4)
 
 
 if __name__ == "__main__":

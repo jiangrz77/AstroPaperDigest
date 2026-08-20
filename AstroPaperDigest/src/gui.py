@@ -41,12 +41,14 @@ sys.path.insert(0, str(_PROJECT_DIR))
 from src.digest_parser import parse_digest, get_latest_digest_path, get_digest_path_for_date, get_available_dates
 from src import updater
 from src.preference_learning import (
+    ensure_learned_profile,
     load_learned_profile,
     rebuild_learned_profile,
     reset_learned_profile,
 )
 from src.feedback_state import apply_to_digest, clear_date, get_adjustment, record_adjustment
 from src.progress import parse as parse_progress
+from src.scoring import apply_source_adjustment, feedback_step, score_to_stars
 
 FEEDBACK_FILE = os.path.join(_PROJECT_DIR, "feedback.json")
 PREFERENCES_FILE = os.path.join(_PROJECT_DIR, "preferences.json")
@@ -1378,7 +1380,7 @@ textarea{height:90px;resize:vertical}
         </div>
       <div class="card" id="learned-preferences">
         <h2>Learned Preferences</h2>
-        <p class="sub">Learned from your Overrated / Underrated feedback; you can also adjust manually. Weight &gt; 1 = more relevant, &lt; 1 = less relevant, 1 = no effect.</p>
+        <p class="sub">Learned from your −★ / +★ feedback; you can also adjust manually. Weight &gt; 1 = more relevant, &lt; 1 = less relevant, 1 = no effect.</p>
         <p class="hint">Auto = learned from your feedback; Manual = your own value (takes priority over auto). Ignore = stop this item from affecting scores; Restore auto = drop the manual value and return to the learned result.</p>
         <div id="learned-content">Loading…</div>
         <div class="row">
@@ -1505,7 +1507,7 @@ function toggleProfileMode() {
       : '<button class="lp-btn danger" data-op="ignore" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '">Ignore</button>';
     return '<tr>' +
       '<td>' + esc(term) + badge + srcHtml + '</td>' +
-      '<td><input type="number" step="0.05" min="0.5" max="2" value="' + w + '" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '"></td>' +
+      '<td><input type="number" step="0.05" min="0.4" max="2.5" value="' + w + '" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '"></td>' +
       '<td><button class="lp-btn" data-op="set" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '">Save</button>' + secondary + '</td>' +
       '</tr>';
   }
@@ -1539,7 +1541,7 @@ function toggleProfileMode() {
       html += '</tbody></table>';
     }
     if (!kwKeys.length && !cwKeys.length) {
-      html += '<p class="lp-empty">No learned weights yet. Mark papers Overrated / Underrated in a digest to build them.</p>';
+      html += '<p class="lp-empty">No learned weights yet. Use −★ / +★ on papers in a digest to build them.</p>';
     }
 
     const ignoredKw = Object.keys(mkw).filter(function (t) { return mkw[t] === null; });
@@ -1744,6 +1746,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 <div class="toolbar">
   <button class="btn-refresh" disabled style="opacity:.6" title="Running...">&#x21bb;</button>
+  <button class="btn-nav" style="opacity:.5">Strongly Recommended (...)</button>
   <button class="btn-nav" style="opacity:.5">Highly Relevant (...)</button>
   <button class="btn-nav" style="opacity:.5">Possibly Relevant (...)</button>
   <button class="btn-nav" style="opacity:.5">Marginal (...)</button>
@@ -1984,14 +1987,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .container{max-width:900px;margin:0 auto;padding:24px 16px}
 .tier-header{margin:28px 0 12px;padding-bottom:8px;border-bottom:2px solid #e0e0e0;scroll-margin-top:165px}
 .tier-header h2{font-size:18px}
+.tier-strongly{color:#d97706;border-color:#d97706}
 .tier-highly{color:#27ae60;border-color:#27ae60}
-.tier-possibly{color:#f39c12;border-color:#f39c12}
+.tier-possibly{color:#2563eb;border-color:#2563eb}
 .tier-marginal{color:#95a5a6;border-color:#95a5a6}
 .card{background:#fff;border-radius:10px;padding:18px 20px;margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,.08);transition:box-shadow .2s}
 .card:hover{box-shadow:0 3px 12px rgba(0,0,0,.12)}
 .card-title{font-size:15px;font-weight:600;color:#2c3e50;margin-bottom:6px;display:flex;align-items:flex-start;gap:10px}
-.score-badge{display:inline-block;min-width:38px;text-align:center;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:700;color:#fff;flex-shrink:0}
-.score-high{background:#27ae60}.score-mid{background:#f39c12}.score-low{background:#e74c3c}
+.score-badge{display:inline-block;min-width:82px;text-align:center;padding:3px 8px;border-radius:12px;font-size:12px;font-weight:700;letter-spacing:1px;color:#fff;flex-shrink:0}
+.score-strong{background:#d97706}.score-high{background:#27ae60}.score-mid{background:#2563eb}.score-low{background:#95a5a6}.score-failed{background:#dc2626;letter-spacing:0}
 .adj-badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:700;flex-shrink:0}
 .adj-pos{background:#e8f5e9;color:#2e7d32}
 .adj-neg{background:#fdecea;color:#c62828}
@@ -2006,8 +2010,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .card-actions a:hover{text-decoration:underline}
 .fb-btn{padding:4px 12px;border:1px solid #ddd;border-radius:14px;font-size:12px;cursor:pointer;background:#fff;transition:all .2s}
 .fb-btn:hover{border-color:#999}
-.fb-overrated{color:#e74c3c}.fb-overrated:hover,.fb-overrated.active{background:#e74c3c;color:#fff;border-color:#e74c3c}
-.fb-underrated{color:#27ae60}.fb-underrated:hover,.fb-underrated.active{background:#27ae60;color:#fff;border-color:#27ae60}
+.fb-minus{color:#dc2626}.fb-minus:hover{background:#fee2e2;border-color:#fca5a5}
+.fb-plus{color:#15803d}.fb-plus:hover{background:#dcfce7;border-color:#86efac}
+.fb-btn:disabled{opacity:.38;cursor:default;background:#fff;border-color:#ddd}
 .filter-menu{position:relative;margin-left:auto}
 .btn-filter{height:36px;display:flex;align-items:center;gap:7px;padding:0 11px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#334155;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
 .btn-filter:hover,.btn-filter[aria-expanded="true"]{border-color:#93c5fd;background:#eff6ff;color:#1d4ed8}
@@ -2061,9 +2066,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 <div class="toolbar">
   <button class="btn-refresh" onclick="rerunWithPrefs()" title="Re-run pipeline" style="font-size:18px">&#x21bb;</button>
-  <span class="stats" style="font-size:13px;color:#666">Total: {{ digest.total_papers }} papers &nbsp;|&nbsp; Highly relevant: {{ digest.highly_relevant_count }}</span>
+  <span class="stats" style="font-size:13px;color:#666">Total: {{ digest.total_papers }} papers &nbsp;|&nbsp; Highly relevant (4–5★): {{ digest.highly_relevant_count }}</span>
   {% for tier in digest.tiers %}
-  <button class="btn-nav" data-tier-key="{% if 'Highly' in tier.name %}high{% elif 'Possibly' in tier.name %}medium{% else %}low{% endif %}" data-tier-idx="{{ loop.index0 }}" onclick="document.getElementById('tier-{{ loop.index }}').scrollIntoView({behavior:'smooth'})">{{ tier.name }} (<span class="btn-tier-count">{{ tier.papers|length }}</span>)</button>
+  <button class="btn-nav" data-tier-key="{% if 'Strongly' in tier.name %}strong{% elif 'Highly' in tier.name %}high{% elif 'Possibly' in tier.name %}medium{% else %}low{% endif %}" data-tier-idx="{{ loop.index0 }}" onclick="document.getElementById('tier-{{ loop.index }}').scrollIntoView({behavior:'smooth'})">{{ tier.name }} (<span class="btn-tier-count">{{ tier.papers|length }}</span>)</button>
   {% endfor %}
   <div class="filter-menu" id="filter-menu">
     <button class="btn-filter" type="button" id="filter-trigger" aria-expanded="false" aria-controls="filter-popover">
@@ -2100,16 +2105,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 <div class="container">
 {% for tier in digest.tiers %}
-  <div class="tier-header {% if 'Highly' in tier.name %}tier-highly{% elif 'Possibly' in tier.name %}tier-possibly{% else %}tier-marginal{% endif %}" id="tier-{{ loop.index }}" data-tier="{% if 'Highly' in tier.name %}high{% elif 'Possibly' in tier.name %}medium{% else %}low{% endif %}">
+  <div class="tier-header {% if 'Strongly' in tier.name %}tier-strongly{% elif 'Highly' in tier.name %}tier-highly{% elif 'Possibly' in tier.name %}tier-possibly{% else %}tier-marginal{% endif %}" id="tier-{{ loop.index }}" data-tier="{% if 'Strongly' in tier.name %}strong{% elif 'Highly' in tier.name %}high{% elif 'Possibly' in tier.name %}medium{% else %}low{% endif %}">
     <h2><span class="tier-name-text">{{ tier.name }}</span> (<span class="tier-count">{{ tier.papers|length }}</span>)</h2>
   </div>
   {% for paper in tier.papers %}
   <div class="card" id="card-{{ paper.paper_id | replace('.', '-') }}" data-paper-type="{{ paper.paper_type | default('new') }}" data-categories="{{ paper.categories }}" data-base-score="{{ paper.base_score | default(paper.score) }}" data-score="{{ paper.score }}">
     <div class="card-title">
       {% if paper.scoring_failed %}
-      <span class="score-badge score-low" style="background:#dc2626">No score</span>
+      <span class="score-badge score-failed">No score</span>
       {% else %}
-      <span class="score-badge {% if paper.score >= 7 %}score-high{% elif paper.score >= 5 %}score-mid{% else %}score-low{% endif %}" data-role="score">{{ paper.score }}/10</span>
+      <span class="score-badge {% if paper.score == 5 %}score-strong{% elif paper.score == 4 %}score-high{% elif paper.score >= 2 %}score-mid{% else %}score-low{% endif %}" data-role="score" aria-label="{{ paper.score }} out of 5 stars">{{ star_display(paper.score) }}</span>
       {% if paper.score_adjustment %}<span class="adj-badge {% if paper.score_adjustment > 0 %}adj-pos{% else %}adj-neg{% endif %}" title="Preference adjustment (relative to LLM raw score)">{{ '%+.1f' | format(paper.score_adjustment) }}</span>{% endif %}
       {% endif %}
       <span>{{ paper.title }}</span>
@@ -2120,8 +2125,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <button class="abstract-toggle" type="button" data-target="abs-{{ paper.paper_id | replace('.', '-') }}">Show more &#9660;</button>{% endif %}
     <div class="card-actions">
       {% if paper.link %}<a href="{{ paper.link }}" target="_blank">arxiv:{{ paper.paper_id }}</a>{% endif %}
-      <button class="fb-btn fb-overrated" data-id="{{ paper.paper_id }}" data-title="{{ paper.title[:80] }}" data-score="{{ paper.score }}" onclick="giveFeedback(this,'overrated')">Overrated</button>
-      <button class="fb-btn fb-underrated" data-id="{{ paper.paper_id }}" data-title="{{ paper.title[:80] }}" data-score="{{ paper.score }}" onclick="giveFeedback(this,'underrated')">Underrated</button>
+      {% if not paper.scoring_failed %}<button class="fb-btn fb-minus" data-id="{{ paper.paper_id }}" data-title="{{ paper.title[:80] }}" onclick="giveFeedback(this,'overrated')" title="Reduce by one star" aria-label="Reduce rating by one star" {% if paper.score <= 1 %}disabled{% endif %}>− ★</button>
+      <button class="fb-btn fb-plus" data-id="{{ paper.paper_id }}" data-title="{{ paper.title[:80] }}" onclick="giveFeedback(this,'underrated')" title="Increase by one star" aria-label="Increase rating by one star" {% if paper.score >= 5 %}disabled{% endif %}>+ ★</button>{% endif %}
     </div>
   </div>
   {% endfor %}
@@ -2201,7 +2206,7 @@ document.addEventListener('keydown', function (event) {
 });
 applyCategoryDisplay();
 function tierKey(score) {
-  return score >= 7 ? 'high' : (score >= 5 ? 'medium' : 'low');
+  return score === 5 ? 'strong' : (score === 4 ? 'high' : (score >= 2 ? 'medium' : 'low'));
 }
 function updateTierCounts() {
   refreshVisibleCounts();
@@ -2227,15 +2232,23 @@ function moveCardToTier(card, score) {
 function updateCardScore(card, score) {
   const badge = card.querySelector('[data-role="score"]');
   if (!badge) return;
-  badge.textContent = score + '/10';
-  badge.classList.remove('score-high', 'score-mid', 'score-low');
-  badge.classList.add(score >= 7 ? 'score-high' : (score >= 5 ? 'score-mid' : 'score-low'));
+  badge.textContent = '★'.repeat(score) + '☆'.repeat(5 - score);
+  badge.setAttribute('aria-label', score + ' out of 5 stars');
+  badge.classList.remove('score-strong', 'score-high', 'score-mid', 'score-low');
+  badge.classList.add(score === 5 ? 'score-strong' : (score === 4 ? 'score-high' : (score >= 2 ? 'score-mid' : 'score-low')));
   card.dataset.score = String(score);
+}
+function updateFeedbackButtons(card) {
+  const score = Number(card.dataset.score || 0);
+  const minus = card.querySelector('.fb-minus');
+  const plus = card.querySelector('.fb-plus');
+  if (minus) minus.disabled = score <= 1;
+  if (plus) plus.disabled = score >= 5;
 }
 function giveFeedback(btn, action) {
   const id = btn.dataset.id, title = btn.dataset.title;
   const card = btn.closest('.card');
-  btn.disabled = true;
+  card.querySelectorAll('.fb-btn').forEach(function (item) { item.disabled = true; });
   fetch('/feedback', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({paper_id:id, title:title, action:action, original_score:parseInt(card.dataset.baseScore || '0'), date: DIGEST_DATE})
   }).then(r=>r.json()).then(d=>{
@@ -2243,7 +2256,7 @@ function giveFeedback(btn, action) {
       updateCardScore(card, d.score);
       moveCardToTier(card, d.score);
     }
-  }).catch(function () {}).finally(function () { btn.disabled = false; });
+  }).catch(function () {}).finally(function () { updateFeedbackButtons(card); });
 }
 
 function rerunWithPrefs() {
@@ -2387,10 +2400,13 @@ function refreshVisibleCounts() {
   // category, cross-list and replacement filters are all applied.
   const statsEl = document.querySelector('.stats');
   if (statsEl) {
+    const strongTier = document.querySelector('.tier-header[data-tier="strong"]');
     const highTier = document.querySelector('.tier-header[data-tier="high"]');
+    const strongIndex = Array.prototype.indexOf.call(tierHeaders, strongTier);
     const highIndex = Array.prototype.indexOf.call(tierHeaders, highTier);
-    const visibleHighly = highTier ? countVisibleBetween(highTier, tierHeaders[highIndex + 1] || null) : 0;
-    statsEl.innerHTML = `Total: ${totalVisible} papers &nbsp;|&nbsp; Highly relevant: ${visibleHighly}`;
+    const visibleStrong = strongTier ? countVisibleBetween(strongTier, tierHeaders[strongIndex + 1] || null) : 0;
+    const visibleHigh = highTier ? countVisibleBetween(highTier, tierHeaders[highIndex + 1] || null) : 0;
+    statsEl.innerHTML = `Total: ${totalVisible} papers &nbsp;|&nbsp; Highly relevant (4–5★): ${visibleStrong + visibleHigh}`;
   }
 }
 </script>
@@ -2691,6 +2707,11 @@ def _load_full_abstracts(date_str):
         return {}
 
 
+def _star_display(score) -> str:
+    value = max(1, min(5, int(score)))
+    return "★" * value + "☆" * (5 - value)
+
+
 def _render_digest(digest=None):
     """Render digest template with computed variables."""
     d = digest or _current_digest
@@ -2742,6 +2763,7 @@ def _render_digest(digest=None):
         display_categories_all=list(_DEFAULT_ARXIV_CATEGORIES),
         today_str=today_str,
         full_abstracts=full_abstracts,
+        star_display=_star_display,
     )
 
 
@@ -3013,12 +3035,15 @@ def post_feedback():
     # profile can extract meaningful topic signals later.
     categories = []
     abstract_snippet = ""
+    matched_paper = None
+    d = None
     digest_path = get_digest_path_for_date(date_str)
     if digest_path:
         d = parse_digest(digest_path)
         for tier in d.get("tiers", []):
             for p in tier.get("papers", []):
                 if p.get("paper_id") == paper_id:
+                    matched_paper = p
                     cats = p.get("categories", "")
                     if isinstance(cats, str):
                         categories = [c.strip() for c in cats.split(",") if c.strip()]
@@ -3040,11 +3065,29 @@ def post_feedback():
         save_feedback(feedback)
         return jsonify({"ok": True, "score": None, "adjustment": 0})
 
+    if matched_paper is None:
+        abort(404, "Paper not found in the selected digest.")
+
+    displayed_score = int(matched_paper.get("score", 0) or 0)
+    scale = int(matched_paper.get("score_scale", 10 if displayed_score > 5 else 5) or 5)
+    source_score = int(matched_paper.get("score_source", displayed_score) or 0)
+    base_score = score_to_stars(source_score, scale)
+    current_delta = get_adjustment(date_str, paper_id)
+    current_score = apply_source_adjustment(source_score, current_delta, scale)
+    if (action == "underrated" and current_score >= 5) or (action == "overrated" and current_score <= 1):
+        return jsonify({
+            "ok": True,
+            "score": current_score,
+            "adjustment": current_delta,
+            "action": action,
+            "recorded": False,
+        })
+
     feedback.append({
             "paper_id": paper_id,
             "title": data.get("title", ""),
             "action": action,
-            "original_score": data.get("original_score", 0),
+            "original_score": base_score,
             "categories": categories,
             "abstract_snippet": abstract_snippet,
             "date": date_str,
@@ -3053,18 +3096,13 @@ def post_feedback():
 
     save_feedback(feedback)
 
+    step = feedback_step(scale)
     delta = record_adjustment(
         date_str,
         paper_id,
-        1 if action == "underrated" else -1,
+        step if action == "underrated" else -step,
     )
-    base_score = 0
-    for tier in (d or {}).get("tiers", []):
-        for paper in tier.get("papers", []):
-            if paper.get("paper_id") == paper_id:
-                base_score = int(paper.get("score", 0) or 0)
-                break
-    effective_score = max(0, min(10, base_score + delta))
+    effective_score = apply_source_adjustment(source_score, delta, scale)
 
     # Rebuild the learned profile so the next ranking uses the new feedback.
     try:
@@ -3078,16 +3116,15 @@ def post_feedback():
         "score": effective_score,
         "adjustment": delta,
         "action": action,
+        "recorded": True,
     })
 
 
 @app.route("/learned-profile", methods=["GET"])
 def learned_profile_get():
     """Return the learned preference profile (derive one if missing)."""
-    profile = load_learned_profile()
-    if profile is None:
-        cfg, _ = _load_config_and_env()
-        profile = rebuild_learned_profile(config_keywords=cfg.get("keywords", []))
+    cfg, _ = _load_config_and_env()
+    profile = ensure_learned_profile(config_keywords=cfg.get("keywords", []))
     return jsonify(profile)
 
 

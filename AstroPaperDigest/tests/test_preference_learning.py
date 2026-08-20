@@ -118,10 +118,10 @@ def test_compute_adjustment_and_clamp():
     paper = {"title": "Chemical evolution in galaxies", "abstract": "chemical evolution",
              "categories": ["astro-ph.GA"]}
     adj = pl.compute_adjustment(paper, profile)
-    assert abs(adj - 1.3) < 1e-9, adj
-    assert pl.apply_adjustment(7, adj) == 8
-    assert pl.apply_adjustment(0, -10) == 0
-    assert pl.apply_adjustment(10, 10) == 10
+    assert abs(adj - 1.0) < 1e-9, adj
+    assert pl.apply_adjustment(4, adj) == 5
+    assert pl.apply_adjustment(1, -10) == 1
+    assert pl.apply_adjustment(5, 10) == 5
 
     many = {"keyword_weights": {f"t{i}": {"weight": 2.0} for i in range(20)},
             "category_weights": {}, "global_calibration": 0.5}

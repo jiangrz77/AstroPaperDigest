@@ -131,9 +131,9 @@ def test_ranker_with_mock():
     
     # Mock LLM response
     mock_scores = [
-        {"index": 0, "score": 9, "reason": "Directly studies chemical enrichment in metal-poor galaxies"},
+        {"index": 0, "score": 5, "reason": "Directly studies chemical enrichment in metal-poor galaxies"},
         {"index": 1, "score": 2, "reason": "Unrelated quantum computing topic"},
-        {"index": 2, "score": 8, "reason": "Studies supernova progenitors in the Milky Way"},
+        {"index": 2, "score": 4, "reason": "Studies supernova progenitors in the Milky Way"},
     ]
     mock_response_text = json.dumps(mock_scores)
     
@@ -162,7 +162,7 @@ def test_ranker_with_mock():
     # Should be sorted by score descending
     assert ranked[0]["score"] >= ranked[1]["score"], "Should be sorted by score"
     assert ranked[0]["id"] == "2607.001", f"Highest score should be paper 1, got {ranked[0]['id']}"
-    assert ranked[0]["score"] == 9
+    assert ranked[0]["score"] == 5
     assert "chemical enrichment" in ranked[0]["reason"].lower()
     
     # Check that reason field is attached
@@ -222,7 +222,7 @@ def test_ranker_markdown_wrapped_json():
     profile = build_profile(os.path.join(os.path.dirname(__file__), "ArxivDailyCollection.bib"))
     
     # Mock markdown-wrapped JSON response
-    wrapped_response = '```json\n[{"index": 0, "score": 7, "reason": "Good match"}]\n```'
+    wrapped_response = '```json\n[{"index": 0, "score": 4, "reason": "Good match"}]\n```'
     
     mock_choice = MagicMock()
     mock_choice.message.content = wrapped_response
@@ -240,13 +240,13 @@ def test_ranker_markdown_wrapped_json():
             ranked = rank_papers(papers, profile, llm_config)
     
     assert len(ranked) == 1
-    assert ranked[0]["score"] == 7
+    assert ranked[0]["score"] == 4
     
     print("  PASSED (parsed markdown-wrapped JSON)")
 
 
 def test_ranker_string_score():
-    """Test ranker handles string scores from LLM (e.g., '8' instead of 8)."""
+    """Test ranker handles string star ratings from the LLM."""
     print("=== Test: Ranker String Score ===")
     
     papers = [
@@ -256,7 +256,7 @@ def test_ranker_string_score():
     profile = build_profile(os.path.join(os.path.dirname(__file__), "ArxivDailyCollection.bib"))
     
     # Mock response with string score
-    string_score_response = '[{"index": 0, "score": "8", "reason": "Good"}]'
+    string_score_response = '[{"index": 0, "score": "4", "reason": "Good"}]'
     
     mock_choice = MagicMock()
     mock_choice.message.content = string_score_response
@@ -274,7 +274,7 @@ def test_ranker_string_score():
             ranked = rank_papers(papers, profile, llm_config)
     
     assert len(ranked) == 1
-    assert ranked[0]["score"] == 8, f"String '8' should be coerced to int 8, got {ranked[0]['score']}"
+    assert ranked[0]["score"] == 4, f"String '4' should be coerced to int 4, got {ranked[0]['score']}"
     assert isinstance(ranked[0]["score"], int), "Score should be int"
     
     print("  PASSED (string score coerced to int)")
@@ -285,9 +285,10 @@ def test_output_generation():
     print("=== Test: Output Generation ===")
     
     papers = [
-        {"id": "2607.111", "title": "Chemical Enrichment in $z>6$ Galaxies", "authors": ["Smith J.", "Doe J."], "published": "2026-07-15T00:00:00", "primary_category": "astro-ph.GA", "categories": ["astro-ph.GA"], "pdf_url": "https://arxiv.org/pdf/2607.111", "abstract": "We study 100% of galaxies with M < 10^10 M_\\odot & find enrichment.", "score": 9, "reason": "Chemical enrichment & metallicity match"},
-        {"id": "2607.222", "title": "Stellar populations in dwarf galaxies", "authors": ["Lee B."], "published": "2026-07-16T00:00:00", "primary_category": "astro-ph.SR", "categories": ["astro-ph.SR"], "pdf_url": "https://arxiv.org/pdf/2607.222", "abstract": "A study of stellar populations.", "score": 6, "reason": "Related to stellar populations"},
-        {"id": "2607.333", "title": "Quantum gravity review", "authors": ["Chen X."], "published": "2026-07-17T00:00:00", "primary_category": "gr-qc", "categories": ["gr-qc"], "pdf_url": "https://arxiv.org/pdf/2607.333", "abstract": "A review.", "score": 2, "reason": "Not relevant"},
+        {"id": "2607.111", "title": "Chemical Enrichment in $z>6$ Galaxies", "authors": ["Smith J.", "Doe J."], "published": "2026-07-15T00:00:00", "primary_category": "astro-ph.GA", "categories": ["astro-ph.GA"], "pdf_url": "https://arxiv.org/pdf/2607.111", "abstract": "We study 100% of galaxies with M < 10^10 M_\\odot & find enrichment.", "score": 5, "reason": "Chemical enrichment & metallicity match"},
+        {"id": "2607.222", "title": "Stellar populations in dwarf galaxies", "authors": ["Lee B."], "published": "2026-07-16T00:00:00", "primary_category": "astro-ph.SR", "categories": ["astro-ph.SR"], "pdf_url": "https://arxiv.org/pdf/2607.222", "abstract": "A study of stellar populations.", "score": 3, "reason": "Related to stellar populations"},
+        {"id": "2607.333", "title": "Quantum gravity review", "authors": ["Chen X."], "published": "2026-07-17T00:00:00", "primary_category": "gr-qc", "categories": ["gr-qc"], "pdf_url": "https://arxiv.org/pdf/2607.333", "abstract": "A review.", "score": 1, "reason": "Not relevant"},
+        {"id": "2607.444", "title": "Metal-poor stars in the Milky Way", "authors": ["Garcia R."], "published": "2026-07-18T00:00:00", "primary_category": "astro-ph.GA", "categories": ["astro-ph.GA"], "pdf_url": "https://arxiv.org/pdf/2607.444", "abstract": "A highly relevant stellar archaeology study.", "score": 4, "reason": "Closely matches stellar archaeology interests"},
     ]
     
     # Test BibTeX output
@@ -295,7 +296,7 @@ def test_output_generation():
         bib_path = write_bibtex(
             papers,
             bib_dir,
-            threshold=7,
+            threshold=4,
             output_date="2026-07-15",
         )
         
@@ -314,7 +315,7 @@ def test_output_generation():
         write_bibtex(
             papers,
             bib_dir,
-            threshold=7,
+            threshold=4,
             output_date="2026-07-15",
         )
         with open(bib_path) as f:
@@ -324,17 +325,17 @@ def test_output_generation():
         print("  BibTeX: PASSED")
     
     # Test Markdown digest
-    digest = generate_markdown_digest(papers, threshold=7)
+    digest = generate_markdown_digest(papers, threshold=4)
     
-    assert "## Highly Relevant" in digest, "Should have Highly Relevant section"
+    assert "## Strongly Recommended" in digest, "Should have Strongly Recommended section"
     assert "## Possibly Relevant" in digest, "Should have Possibly Relevant section"
     assert "## Marginal" in digest, "Should have Marginal section"
     assert "Chemical Enrichment" in digest, "Should contain paper title"
-    assert "9/10" in digest, "Should show score"
+    assert "5/5" in digest, "Should show star rating"
     
     # Test file writing
     with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as tmpdir:
-        digest_path = write_digest(papers, tmpdir, threshold=7)
+        digest_path = write_digest(papers, tmpdir, threshold=4)
         assert os.path.exists(digest_path), "Digest file should exist"
         with open(digest_path) as f:
             content = f.read()
@@ -367,14 +368,14 @@ def test_full_pipeline_dry_run():
     
     # Step 4: Mock ranking
     for p in candidates:
-        p["score"] = 7
+        p["score"] = 4
         p["reason"] = "Mock score"
     
     # Step 5: Output
     with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as bib_dir:
         with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as digest_dir:
-            bib_path = write_bibtex(candidates, bib_dir, threshold=7)
-            digest_path = write_digest(candidates, digest_dir, threshold=7)
+            bib_path = write_bibtex(candidates, bib_dir, threshold=4)
+            digest_path = write_digest(candidates, digest_dir, threshold=4)
             
             assert bib_path, "Should return a BibTeX path"
             assert os.path.exists(bib_path), "BibTeX file should exist"

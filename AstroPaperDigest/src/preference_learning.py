@@ -24,18 +24,19 @@ FEEDBACK_FILE = os.path.join(str(_PROJECT_DIR), "feedback.json")
 LEARNED_PROFILE_FILE = os.path.join(_PROJECT_DIR, "learned_profile.json")
 
 # --- Tuning constants -------------------------------------------------------
-WEIGHT_MIN = 0.5
-WEIGHT_MAX = 2.0
-BOOST = 1.25           # factor applied for an "underrated" hit
-PENALTY = 0.8          # factor applied for an "overrated" hit
+WEIGHT_MIN = 0.4
+WEIGHT_MAX = 2.5
+BOOST = 1.4            # factor applied for a +★ (formerly "underrated") hit
+PENALTY = 0.7          # factor applied for a -★ (formerly "overrated") hit
 HALF_LIFE_DAYS = 60.0  # feedback influence decays back to 1.0 over this half-life
-CALIBRATION_PER = 0.15   # global offset per (underrated - overrated) count
+CALIBRATION_PER = 0.1    # global star offset per (+★ - -★) event
 CALIBRATION_MAX = 0.5
-ADJUSTMENT_MAX = 2.0     # deterministic score adjustment clamp (points)
-KEYWORD_ADJUST_COEF = 0.5   # score points per (weight - 1.0) per matched keyword
-CATEGORY_ADJUST_COEF = 1.0  # score points per (weight - 1.0) per matched category
+ADJUSTMENT_MAX = 1.0     # deterministic score adjustment clamp (stars)
+KEYWORD_ADJUST_COEF = 0.4   # stars per (weight - 1.0) per matched keyword
+CATEGORY_ADJUST_COEF = 0.75 # stars per (weight - 1.0) per matched category
 MIN_FEEDBACK_FOR_TERM = 2   # a discovered term must appear in N distinct papers
 MAX_LEARNED_TERMS = 100
+TUNING_VERSION = 2       # rebuild older profiles under the five-star weights
 
 _TOKEN_RE = re.compile(r"[a-z][a-z0-9]{2,}")
 
@@ -281,12 +282,16 @@ def derive_learned_profile(feedback: list, config_keywords=None, manual=None,
         },
         "global_calibration": round(cal, 3),
         "manual": manual,
+        "tuning_version": TUNING_VERSION,
         "updated_at": now.isoformat(timespec="seconds"),
     }
 
 
 def rebuild_learned_profile(config_keywords=None, manual=None) -> dict:
     """Rebuild + persist the learned profile from feedback.json."""
+    if manual is None:
+        existing = load_learned_profile() or {}
+        manual = existing.get("manual", {}) or {}
     profile = derive_learned_profile(load_feedback(), config_keywords=config_keywords,
                                      manual=manual)
     save_learned_profile(profile)
@@ -296,7 +301,7 @@ def rebuild_learned_profile(config_keywords=None, manual=None) -> dict:
 def ensure_learned_profile(config_keywords=None) -> dict:
     """Return the persisted profile, deriving a fresh one if missing."""
     profile = load_learned_profile()
-    if profile is None:
+    if profile is None or profile.get("tuning_version") != TUNING_VERSION:
         profile = rebuild_learned_profile(config_keywords=config_keywords)
     return profile
 
@@ -363,5 +368,5 @@ def compute_adjustment(paper: dict, profile: dict) -> float:
 
 
 def apply_adjustment(raw_score, adjustment: float) -> int:
-    """Combine an LLM raw score with an adjustment and clamp to 0-10."""
-    return max(0, min(10, int(round(float(raw_score) + adjustment))))
+    """Combine an LLM raw rating with an adjustment and clamp to 1–5 stars."""
+    return max(1, min(5, int(round(float(raw_score) + adjustment))))

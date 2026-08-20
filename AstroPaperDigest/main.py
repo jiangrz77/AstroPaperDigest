@@ -28,6 +28,7 @@ from src.output import write_bibtex, write_digest, generate_markdown_digest
 from src.notifier import send_digest_email
 from src.digest_parser import parse_digest, get_latest_digest_path
 from src.progress import emit
+from src.scoring import normalize_threshold
 
 
 # Every daily digest covers the complete astro-ph announcement.  The user's
@@ -96,7 +97,7 @@ def _write_empty_digest(digest_dir: str, reason: str, digest_date: str = None, n
     content = f"""# AstroPaperDigest - {d}
 
 **Total papers reviewed:** 0
-**Highly relevant (score >= 7):** 0
+**Highly relevant (4–5 stars):** 0
 **Status:** {reason}
 **Content:** empty
 """
@@ -168,7 +169,8 @@ def main():
     if staging_dir:
         output_cfg["digest_dir"] = os.path.join(staging_dir, "digests")
         output_cfg["bibtex_dir"] = os.path.join(staging_dir, "bibtex")
-    threshold = args.threshold if args.threshold is not None else filter_cfg.get("score_threshold", 7)
+    configured_threshold = args.threshold if args.threshold is not None else filter_cfg.get("score_threshold", 4)
+    threshold = normalize_threshold(configured_threshold)
     
     print("=== Astro Paper Digest ===\n")
     
@@ -326,6 +328,7 @@ def main():
     unranked = [p for p in papers if p["id"] not in ranked_ids]
     for p in unranked:
         p["score"] = 0
+        p["scoring_failed"] = True
         p["reason"] = "Not scored"
     all_papers = ranked + unranked
     print(f"  Including {len(unranked)} unranked papers in digest")

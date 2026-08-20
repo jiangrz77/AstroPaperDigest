@@ -114,9 +114,11 @@ def spearman(a: list, b: list):
 
 
 def tier(score: int) -> str:
-    if score >= 7:
+    if score == 5:
+        return "strong"
+    if score == 4:
         return "high"
-    if score >= 5:
+    if score >= 2:
         return "medium"
     return "low"
 

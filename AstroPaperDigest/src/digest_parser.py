@@ -4,6 +4,8 @@ import glob
 import os
 import re
 
+from .scoring import score_to_stars
+
 
 def parse_digest(digest_path: str) -> dict:
     """Parse a markdown digest file into structured data.
@@ -93,6 +95,8 @@ def _parse_single_paper(block: str) -> dict:
     paper = {
         "title": title,
         "score": 0,
+        "score_source": 0,
+        "score_scale": 5,
         "score_adjustment": 0.0,
         "scoring_failed": False,
         "reason": "",
@@ -112,15 +116,20 @@ def _parse_single_paper(block: str) -> dict:
         if reason_match:
             paper["reason"] = reason_match.group(1).strip()
     else:
-        score_match = re.search(r"\*\*Score:\*\* (\d+)/10 \| \*\*Reason:\*\* (.+)", block)
+        score_match = re.search(r"\*\*Score:\*\* (\d+)/(5|10) \| \*\*Reason:\*\* (.+)", block)
         if score_match:
-            paper["score"] = int(score_match.group(1))
-            paper["reason"] = score_match.group(2).strip()
+            source_score = int(score_match.group(1))
+            score_scale = int(score_match.group(2))
+            paper["score_source"] = source_score
+            paper["score_scale"] = score_scale
+            paper["score"] = score_to_stars(source_score, score_scale)
+            paper["reason"] = score_match.group(3).strip()
 
     # Extract deterministic preference adjustment (added by ranker)
     adj_match = re.search(r"\*\*Adjustment:\*\* ([+-]?\d+(?:\.\d+)?)", block)
     if adj_match:
-        paper["score_adjustment"] = float(adj_match.group(1))
+        adjustment = float(adj_match.group(1))
+        paper["score_adjustment"] = adjustment / 2.0 if paper["score_scale"] == 10 else adjustment
     
     # Extract authors
     authors_match = re.search(r"\*\*Authors:\*\* (.+)", block)
