@@ -52,6 +52,11 @@ _MIN_REQUEST_INTERVAL = 3.1
 _PAGE_SIZE = 300
 # arXiv throttles large id_list requests; keep each API call small.
 _ID_LIST_BATCH_SIZE = 50
+# A stalled request (e.g. DNS/connect on a flaky network) must never hang the
+# pipeline forever: any batch that exceeds this deadline is retried, then
+# reported as an error.
+_FETCH_BATCH_TIMEOUT = 120
+_RATE_LIMIT_LOCK_TIMEOUT = 30
 from src import paths as _paths
 _PROJECT_DIR = _paths.data_dir()
 (_PROJECT_DIR / "output").mkdir(parents=True, exist_ok=True)
@@ -77,7 +82,17 @@ def _api_request_session():
     with _API_THREAD_LOCK:
         _RATE_LIMIT_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(_RATE_LIMIT_FILE, "a+", encoding="utf-8") as state:
-            fcntl.flock(state.fileno(), fcntl.LOCK_EX)
+            # Bounded lock acquisition: if another (possibly stuck) process
+            # holds the lock, give up after a while instead of blocking forever.
+            lock_deadline = time.monotonic() + _RATE_LIMIT_LOCK_TIMEOUT
+            while True:
+                try:
+                    fcntl.flock(state.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() > lock_deadline:
+                        raise
+                    time.sleep(0.5)
             try:
                 state.seek(0)
                 try:
@@ -322,8 +337,13 @@ def _fetch_listed_papers(
         search = arxiv.Search(id_list=batch, max_results=len(batch))
         for attempt in range(2):
             try:
+                batch_deadline = time.monotonic() + _FETCH_BATCH_TIMEOUT
                 with _api_request_session():
                     for result in client.results(search):
+                        if time.monotonic() > batch_deadline:
+                            raise requests.exceptions.Timeout(
+                                f"arXiv batch timed out after {_FETCH_BATCH_TIMEOUT}s"
+                            )
                         item = _paper_from_result(
                             result,
                             categories,
@@ -368,8 +388,13 @@ def _fetch_listed_papers(
               "retrying individually ...")
         for i in missing:
             try:
+                single_deadline = time.monotonic() + _FETCH_BATCH_TIMEOUT
                 with _api_request_session():
                     for result in client.results(arxiv.Search(id_list=[i], max_results=1)):
+                        if time.monotonic() > single_deadline:
+                            raise requests.exceptions.Timeout(
+                                f"single-id arXiv query timed out after {_FETCH_BATCH_TIMEOUT}s"
+                            )
                         item = _paper_from_result(
                             result,
                             categories,
