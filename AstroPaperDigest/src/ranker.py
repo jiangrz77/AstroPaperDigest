@@ -23,7 +23,7 @@ from src import paths as _paths
 FEEDBACK_FILE = str(_paths.data_dir() / "feedback.json")
 
 # --- Ranking tunables -------------------------------------------------------
-BATCH_SIZE = 40          # papers per LLM request (context- and response-safe)
+BATCH_SIZE = 50          # papers per LLM request (context- and response-safe)
 VOTES = 5                # independent LLM calls per batch; per-paper median wins
 MIN_VOTES = 3            # below this many valid votes a paper is marked No score
 MAX_WORKERS = 3          # parallel LLM calls (bounded; 429 backoff keeps it polite)
