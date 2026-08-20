@@ -36,8 +36,10 @@ jobs:
           {
             echo ""
             echo "## Checksums (SHA-256)"
-            for f in AstroPaperDigest/dist/AstroPaperDigest-*.dmg \
-                     AstroPaperDigest/dist/AstroPaperDigest-v*.app.zip \
+            # .app.zip FIRST: the in-app updater verifies against the first
+            # SHA-256 it finds in the release body.
+            for f in AstroPaperDigest/dist/AstroPaperDigest-v*.app.zip \
+                     AstroPaperDigest/dist/AstroPaperDigest-*.dmg \
                      AstroPaperDigest/dist/AstroPaperDigest-v*.source.zip; do
               echo "- $(basename "$f")"
               echo "  SHA256: $(shasum -a 256 "$f" | awk '{print $1}')"
