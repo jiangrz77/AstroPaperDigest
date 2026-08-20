@@ -1462,14 +1462,30 @@ function toggleProfileMode() {
   const bar = document.getElementById('save-bar');
   const discard = document.getElementById('discard-settings');
   let dirty = false;
+  function readFormState() {
+    if (!form) return '';
+    const values = [];
+    form.querySelectorAll('input, select, textarea').forEach(function (field) {
+      if (field.type === 'file') {
+        values.push([field.name, Array.from(field.files || []).map(function (file) { return file.name; })]);
+      } else if (field.type === 'checkbox' || field.type === 'radio') {
+        values.push([field.name, field.value, field.checked]);
+      } else {
+        values.push([field.name, field.value]);
+      }
+    });
+    return JSON.stringify(values);
+  }
+  const cleanState = readFormState();
   function setDirty(value) {
     dirty = value;
     if (bar) bar.hidden = !dirty;
   }
-  window.markSettingsDirty = function () { setDirty(true); };
+  function syncDirty() { setDirty(readFormState() !== cleanState); }
+  window.markSettingsDirty = syncDirty;
   if (form) {
-    form.addEventListener('input', function () { setDirty(true); });
-    form.addEventListener('change', function () { setDirty(true); });
+    form.addEventListener('input', syncDirty);
+    form.addEventListener('change', syncDirty);
     form.addEventListener('submit', function () { setDirty(false); });
   }
   if (discard) discard.addEventListener('click', function () { window.location.reload(); });
@@ -2265,9 +2281,13 @@ function updateFeedbackButtons(card) {
   if (minus) minus.disabled = score <= 1;
   if (plus) plus.disabled = score >= 5;
 }
-function showPendingOrderRefresh() {
+function updatePendingOrderRefresh() {
   const refresh = document.getElementById('refresh-order');
-  if (refresh) refresh.hidden = false;
+  if (!refresh) return;
+  const pending = Array.from(document.querySelectorAll('.card')).some(function (card) {
+    return Number(card.dataset.score || 0) !== Number(card.dataset.baseScore || 0);
+  });
+  refresh.hidden = !pending;
 }
 function giveFeedback(btn, action) {
   const id = btn.dataset.id, title = btn.dataset.title;
@@ -2278,7 +2298,7 @@ function giveFeedback(btn, action) {
   }).then(r=>r.json()).then(d=>{
     if(d.ok){
       updateCardScore(card, d.score);
-      showPendingOrderRefresh();
+      updatePendingOrderRefresh();
     }
   }).catch(function () {}).finally(function () { updateFeedbackButtons(card); });
 }
@@ -2299,9 +2319,9 @@ function refreshOrder() {
     grouped[key].sort(function (a, b) { return Number(b.dataset.score || 0) - Number(a.dataset.score || 0); });
     grouped[key].forEach(function (card) { container.insertBefore(card, next); });
   });
+  cards.forEach(function (card) { card.dataset.baseScore = card.dataset.score; });
   refreshVisibleCounts();
-  const refresh = document.getElementById('refresh-order');
-  if (refresh) refresh.hidden = true;
+  updatePendingOrderRefresh();
 }
 
 function rerunWithPrefs() {
