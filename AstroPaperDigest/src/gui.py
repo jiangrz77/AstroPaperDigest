@@ -1723,7 +1723,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .btn-nav{background:#ecf0f1;color:#555}.btn-nav:hover{background:#dfe6e9}
 .paper-total{display:inline-flex;align-items:center;height:32px;padding:0 10px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;color:#64748b;font-size:12px;font-weight:600;white-space:nowrap}
 .btn-nav-star{background:#fff;border:1px solid currentColor}.btn-nav-star:hover{background:#f8fafc}
-.nav-star-5{color:#f4b400}.nav-star-4{color:#27ae60}.nav-star-3,.nav-star-2{color:#2563eb}.nav-star-1{color:#95a5a6}
+.nav-star-5{color:#f4b400}.nav-star-4{color:#27ae60}.nav-star-3{color:#2563eb}.nav-star-2{color:#6366f1}.nav-star-1{color:#95a5a6}
 .date-display{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;font-size:16px;font-weight:600;color:#fff;cursor:default;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);line-height:1}
 .date-arrow{display:inline-flex;align-items:center;justify-content:center;height:34px;width:34px;padding:0;box-sizing:border-box;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;cursor:default;font-size:15px;line-height:1;opacity:.5}
 .btn-today{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;line-height:1}
@@ -2001,7 +2001,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .btn-nav-active{background:#2c3e50;color:#fff}
 .paper-total{display:inline-flex;align-items:center;height:32px;padding:0 10px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;color:#64748b;font-size:12px;font-weight:600;white-space:nowrap}
 .btn-nav-star{background:#fff;border:1px solid currentColor}.btn-nav-star:hover{background:#f8fafc}
-.nav-star-5{color:#f4b400}.nav-star-4{color:#27ae60}.nav-star-3,.nav-star-2{color:#2563eb}.nav-star-1{color:#95a5a6}
+.nav-star-5{color:#f4b400}.nav-star-4{color:#27ae60}.nav-star-3{color:#2563eb}.nav-star-2{color:#6366f1}.nav-star-1{color:#95a5a6}
 .scope-banner{display:none;align-items:center;gap:12px;padding:7px 32px;background:#eff6ff;border-bottom:1px solid #bfdbfe;color:#1e3a5f;font-size:12px;line-height:1.4}
 .scope-banner-text{min-width:0;flex:1}
 .scope-banner-actions{display:flex;align-items:center;gap:10px;white-space:nowrap;margin-left:auto;color:#476581}
@@ -2018,7 +2018,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .card:hover{box-shadow:0 3px 12px rgba(0,0,0,.12)}
 .card-title{font-size:15px;font-weight:600;color:#2c3e50;margin-bottom:6px;display:flex;align-items:flex-start;gap:10px}
 .score-badge{display:inline-block;min-width:82px;text-align:center;padding:3px 8px;border-radius:12px;background:#fff;font-size:15px;font-weight:700;letter-spacing:1px;line-height:1;color:#cbd5e1;flex-shrink:0}
-.score-strong{color:#f4b400}.score-high{color:#27ae60}.score-mid{color:#2563eb}.score-low{color:#95a5a6}.score-failed{background:#dc2626;color:#fff;font-size:12px;letter-spacing:0}
+.score-strong{color:#f4b400}.score-high{color:#27ae60}.score-three{color:#2563eb}.score-two{color:#6366f1}.score-low{color:#95a5a6}.score-failed{background:#dc2626;color:#fff;font-size:12px;letter-spacing:0}
 .stars-empty{color:#d7dde5}
 .adj-badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:700;flex-shrink:0}
 .adj-pos{background:#e8f5e9;color:#2e7d32}
@@ -2139,7 +2139,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
       {% if paper.scoring_failed %}
       <span class="score-badge score-failed">No score</span>
       {% else %}
-      <span class="score-badge {% if paper.score == 5 %}score-strong{% elif paper.score == 4 %}score-high{% elif paper.score >= 2 %}score-mid{% else %}score-low{% endif %}" data-role="score" aria-label="{{ paper.score }} out of 5 stars"><span class="stars-filled">{{ '★' * paper.score }}</span><span class="stars-empty">{{ '☆' * (5 - paper.score) }}</span></span>
+      <span class="score-badge {% if paper.score == 5 %}score-strong{% elif paper.score == 4 %}score-high{% elif paper.score == 3 %}score-three{% elif paper.score == 2 %}score-two{% else %}score-low{% endif %}" data-role="score" aria-label="{{ paper.score }} out of 5 stars"><span class="stars-filled">{{ '★' * paper.score }}</span><span class="stars-empty">{{ '☆' * (5 - paper.score) }}</span></span>
       {% if paper.score_adjustment %}<span class="adj-badge {% if paper.score_adjustment > 0 %}adj-pos{% else %}adj-neg{% endif %}" title="Preference adjustment (relative to LLM raw score)">{{ '%+.1f' | format(paper.score_adjustment) }}</span>{% endif %}
       {% endif %}
       <span>{{ paper.title }}</span>
@@ -2270,8 +2270,8 @@ function updateCardScore(card, score) {
   if (!badge) return;
   badge.innerHTML = '<span class="stars-filled">' + '★'.repeat(score) + '</span><span class="stars-empty">' + '☆'.repeat(5 - score) + '</span>';
   badge.setAttribute('aria-label', score + ' out of 5 stars');
-  badge.classList.remove('score-strong', 'score-high', 'score-mid', 'score-low');
-  badge.classList.add(score === 5 ? 'score-strong' : (score === 4 ? 'score-high' : (score >= 2 ? 'score-mid' : 'score-low')));
+  badge.classList.remove('score-strong', 'score-high', 'score-three', 'score-two', 'score-low');
+  badge.classList.add(score === 5 ? 'score-strong' : (score === 4 ? 'score-high' : (score === 3 ? 'score-three' : (score === 2 ? 'score-two' : 'score-low'))));
   card.dataset.score = String(score);
 }
 function updateFeedbackButtons(card) {
