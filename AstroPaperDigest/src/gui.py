@@ -2018,9 +2018,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .card-actions a:hover{text-decoration:underline}
 .fb-btn{padding:4px 12px;border:1px solid #ddd;border-radius:14px;font-size:12px;cursor:pointer;background:#fff;transition:all .2s}
 .fb-btn:hover{border-color:#999}
-.fb-minus{color:#dc2626}.fb-minus:hover{background:#fee2e2;border-color:#fca5a5}
-.fb-plus{color:#15803d}.fb-plus:hover{background:#dcfce7;border-color:#86efac}
+.fb-minus{color:#95a5a6}.fb-minus:hover{background:#f1f5f9;border-color:#cbd5e1}
+.fb-plus{color:#f4b400}.fb-plus:hover{background:#fff8db;border-color:#f4b400}
 .fb-btn:disabled{opacity:.38;cursor:default;background:#fff;border-color:#ddd}
+.btn-order-refresh{height:36px;padding:0 14px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#475569;font-size:13px;font-weight:600;cursor:pointer}
+.btn-order-refresh:hover{border-color:#93c5fd;background:#eff6ff;color:#1d4ed8}
 .filter-menu{position:relative;margin-left:auto}
 .btn-filter{height:36px;display:flex;align-items:center;gap:7px;padding:0 11px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#334155;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
 .btn-filter:hover,.btn-filter[aria-expanded="true"]{border-color:#93c5fd;background:#eff6ff;color:#1d4ed8}
@@ -2073,9 +2075,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   </div>
 </div>
 <div class="toolbar">
-  <button class="btn-refresh" onclick="rerunWithPrefs()" title="Re-run pipeline" style="font-size:18px">&#x21bb;</button>
+  <button class="btn-refresh" onclick="rerunWithPrefs()" title="Regenerate digest">regen digest</button>
   <span class="paper-total stats" aria-label="Displayed paper count">{{ digest.total_papers }} papers</span>
   {% for star in (5, 4, 3, 2, 1) %}<button class="btn-nav btn-nav-star nav-star-{{ star }}" data-score-nav="{{ star }}" aria-label="{{ star }}-star papers" onclick="scrollToScore({{ star }})">{{ '★' * star }} (<span class="btn-score-count">{{ score_counts.get(star, 0) }}</span>)</button>{% endfor %}
+  <button class="btn-order-refresh" id="refresh-order" type="button" hidden onclick="refreshOrder()">refresh</button>
   <div class="filter-menu" id="filter-menu">
     <button class="btn-filter" type="button" id="filter-trigger" aria-expanded="false" aria-controls="filter-popover">
       <span>Filters</span><span class="filter-summary" id="filter-summary"></span><span class="filter-chevron" aria-hidden="true">⌄</span>
@@ -2131,8 +2134,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <button class="abstract-toggle" type="button" data-target="abs-{{ paper.paper_id | replace('.', '-') }}">Show more &#9660;</button>{% endif %}
     <div class="card-actions">
       {% if paper.link %}<a href="{{ paper.link }}" target="_blank">arxiv:{{ paper.paper_id }}</a>{% endif %}
-      {% if not paper.scoring_failed %}<button class="fb-btn fb-minus" data-id="{{ paper.paper_id }}" data-title="{{ paper.title[:80] }}" onclick="giveFeedback(this,'overrated')" title="Reduce by one star" aria-label="Reduce rating by one star" {% if paper.score <= 1 %}disabled{% endif %}>− ★</button>
-      <button class="fb-btn fb-plus" data-id="{{ paper.paper_id }}" data-title="{{ paper.title[:80] }}" onclick="giveFeedback(this,'underrated')" title="Increase by one star" aria-label="Increase rating by one star" {% if paper.score >= 5 %}disabled{% endif %}>+ ★</button>{% endif %}
+      {% if not paper.scoring_failed %}<button class="fb-btn fb-plus" data-id="{{ paper.paper_id }}" data-title="{{ paper.title[:80] }}" onclick="giveFeedback(this,'underrated')" title="Increase by one star" aria-label="Increase rating by one star" {% if paper.score >= 5 %}disabled{% endif %}>+ ★</button>
+      <button class="fb-btn fb-minus" data-id="{{ paper.paper_id }}" data-title="{{ paper.title[:80] }}" onclick="giveFeedback(this,'overrated')" title="Reduce by one star" aria-label="Reduce rating by one star" {% if paper.score <= 1 %}disabled{% endif %}>− ★</button>{% endif %}
     </div>
   </div>
   {% endfor %}
@@ -2215,7 +2218,11 @@ function scrollToScore(score) {
   const card = Array.from(document.querySelectorAll('.card')).find(function (item) {
     return Number(item.dataset.score || 0) === score && item.style.display !== 'none';
   });
-  if (card) card.scrollIntoView({behavior:'smooth', block:'start'});
+  if (!card) return;
+  const sticky = document.querySelector('.sticky-wrapper');
+  const offset = sticky ? sticky.getBoundingClientRect().height + 12 : 12;
+  const top = card.getBoundingClientRect().top + window.scrollY - offset;
+  window.scrollTo({top: Math.max(0, top), behavior:'smooth'});
 }
 function tierKey(score) {
   return score === 5 ? 'strong' : (score === 4 ? 'high' : (score >= 2 ? 'medium' : 'low'));
@@ -2257,6 +2264,10 @@ function updateFeedbackButtons(card) {
   if (minus) minus.disabled = score <= 1;
   if (plus) plus.disabled = score >= 5;
 }
+function showPendingOrderRefresh() {
+  const refresh = document.getElementById('refresh-order');
+  if (refresh) refresh.hidden = false;
+}
 function giveFeedback(btn, action) {
   const id = btn.dataset.id, title = btn.dataset.title;
   const card = btn.closest('.card');
@@ -2266,9 +2277,30 @@ function giveFeedback(btn, action) {
   }).then(r=>r.json()).then(d=>{
     if(d.ok){
       updateCardScore(card, d.score);
-      moveCardToTier(card, d.score);
+      showPendingOrderRefresh();
     }
   }).catch(function () {}).finally(function () { updateFeedbackButtons(card); });
+}
+
+function refreshOrder() {
+  const cards = Array.from(document.querySelectorAll('.card'));
+  const container = cards.length ? cards[0].parentElement : null;
+  if (!container) return;
+  const grouped = {strong:[], high:[], medium:[], low:[]};
+  cards.forEach(function (card) {
+    grouped[tierKey(Number(card.dataset.score || 1))].push(card);
+    card.remove();
+  });
+  Object.keys(grouped).forEach(function (key) {
+    const header = document.querySelector('.tier-header[data-tier="' + key + '"]');
+    if (!header) return;
+    const next = header.nextElementSibling;
+    grouped[key].sort(function (a, b) { return Number(b.dataset.score || 0) - Number(a.dataset.score || 0); });
+    grouped[key].forEach(function (card) { container.insertBefore(card, next); });
+  });
+  refreshVisibleCounts();
+  const refresh = document.getElementById('refresh-order');
+  if (refresh) refresh.hidden = true;
 }
 
 function rerunWithPrefs() {
