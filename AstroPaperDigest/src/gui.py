@@ -2008,11 +2008,30 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .fb-btn:hover{border-color:#999}
 .fb-overrated{color:#e74c3c}.fb-overrated:hover,.fb-overrated.active{background:#e74c3c;color:#fff;border-color:#e74c3c}
 .fb-underrated{color:#27ae60}.fb-underrated:hover,.fb-underrated.active{background:#27ae60;color:#fff;border-color:#27ae60}
-.checkbox-group{display:flex;gap:15px;align-items:center;margin-left:auto;font-size:13px}
-.checkbox-group label{display:inline-flex;align-items:center;gap:5px;height:36px;cursor:pointer;color:#555}
-.checkbox-group input[type="checkbox"]{cursor:pointer;width:16px;height:16px}
-.category-group{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;color:#555;margin-left:auto}
-.category-group label{display:inline-flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap}
+.filter-menu{position:relative;margin-left:auto}
+.btn-filter{height:36px;display:flex;align-items:center;gap:7px;padding:0 11px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#334155;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
+.btn-filter:hover,.btn-filter[aria-expanded="true"]{border-color:#93c5fd;background:#eff6ff;color:#1d4ed8}
+.filter-summary{color:#64748b;font-size:12px;font-weight:500}
+.filter-chevron{font-size:15px;line-height:1;transition:transform .16s ease}
+.btn-filter[aria-expanded="true"] .filter-chevron{transform:rotate(180deg)}
+.filter-popover{position:absolute;z-index:20;right:0;top:calc(100% + 8px);width:344px;padding:14px;border:1px solid #dbe3ee;border-radius:10px;background:#fff;box-shadow:0 12px 28px rgba(15,23,42,.16)}
+.filter-popover[hidden]{display:none}
+.filter-section+.filter-section{margin-top:14px;padding-top:14px;border-top:1px solid #e5e7eb}
+.filter-section-title{margin-bottom:8px;color:#64748b;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+.filter-section-note{margin:-2px 0 9px;color:#94a3b8;font-size:12px;line-height:1.35}
+.filter-pills{display:flex;gap:7px;flex-wrap:wrap}
+.filter-pill{cursor:pointer}
+.filter-pill input{position:absolute;opacity:0;pointer-events:none}
+.filter-pill span{display:block;padding:6px 9px;border:1px solid #d1d5db;border-radius:999px;background:#fff;color:#475569;font-size:12px;line-height:1;white-space:nowrap;transition:background .14s ease,border-color .14s ease,color .14s ease}
+.filter-pill:hover span{border-color:#93c5fd;color:#1d4ed8}
+.filter-pill input:checked+span{border-color:#2563eb;background:#2563eb;color:#fff}
+.scope-options{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.scope-toggle{cursor:pointer}
+.scope-toggle input{position:absolute;opacity:0;pointer-events:none}
+.scope-toggle span{display:flex;align-items:center;justify-content:center;min-height:34px;padding:0 9px;border:1px solid #d1d5db;border-radius:7px;background:#fff;color:#475569;font-size:12px;font-weight:600;text-align:center;transition:background .14s ease,border-color .14s ease,color .14s ease}
+.scope-toggle:hover span{border-color:#93c5fd;color:#1d4ed8}
+.scope-toggle input:checked+span{border-color:#1d4ed8;background:#dbeafe;color:#1d4ed8}
+@media(max-width:760px){.filter-menu{margin-left:0}.filter-popover{left:0;right:auto;max-width:calc(100vw - 32px)}}
 .date-display{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;font-size:16px;font-weight:600;color:#fff;cursor:pointer;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);line-height:1;user-select:none}
 .date-display:hover{background:rgba(255,255,255,.2)}
 .date-arrow{display:inline-flex;align-items:center;justify-content:center;height:34px;width:34px;padding:0;box-sizing:border-box;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:15px;line-height:1}
@@ -2046,15 +2065,29 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   {% for tier in digest.tiers %}
   <button class="btn-nav" data-tier-key="{% if 'Highly' in tier.name %}high{% elif 'Possibly' in tier.name %}medium{% else %}low{% endif %}" data-tier-idx="{{ loop.index0 }}" onclick="document.getElementById('tier-{{ loop.index }}').scrollIntoView({behavior:'smooth'})">{{ tier.name }} (<span class="btn-tier-count">{{ tier.papers|length }}</span>)</button>
   {% endfor %}
-  <div class="category-group" aria-label="Displayed categories">
-    <span>Categories:</span>
-    {% for category in display_categories_all %}
-    <label><input class="digest-category" type="checkbox" value="{{ category }}" {% if category in display_categories %}checked{% endif %}> {{ category.replace('astro-ph.', '') }}</label>
-    {% endfor %}
-  </div>
-  <div class="checkbox-group">
-    <label><input type="checkbox" id="chk-cross" {% if prefs.include_cross %}checked{% endif %}> Cross-listed</label>
-    <label><input type="checkbox" id="chk-repl" {% if prefs.include_replacements %}checked{% endif %}> Replacements</label>
+  <div class="filter-menu" id="filter-menu">
+    <button class="btn-filter" type="button" id="filter-trigger" aria-expanded="false" aria-controls="filter-popover">
+      <span>Filters</span><span class="filter-summary" id="filter-summary"></span><span class="filter-chevron" aria-hidden="true">⌄</span>
+    </button>
+    <div class="filter-popover" id="filter-popover" hidden>
+      <section class="filter-section" aria-label="Categories">
+        <div class="filter-section-title">Categories</div>
+        <div class="filter-section-note">Choose the research categories shown in this digest.</div>
+        <div class="filter-pills">
+          {% for category in display_categories_all %}
+          <label class="filter-pill"><input class="digest-category" type="checkbox" value="{{ category }}" {% if category in display_categories %}checked{% endif %}><span>{{ category.replace('astro-ph.', '') }}</span></label>
+          {% endfor %}
+        </div>
+      </section>
+      <section class="filter-section" aria-label="Paper scope">
+        <div class="filter-section-title">Paper scope</div>
+        <div class="filter-section-note">Include these paper types in the displayed results.</div>
+        <div class="scope-options">
+          <label class="scope-toggle"><input type="checkbox" id="chk-cross" {% if prefs.include_cross %}checked{% endif %}><span>Cross-listed</span></label>
+          <label class="scope-toggle"><input type="checkbox" id="chk-repl" {% if prefs.include_replacements %}checked{% endif %}><span>Replacements</span></label>
+        </div>
+      </section>
+    </div>
   </div>
 </div>
 <div class="scope-banner" id="scope-banner" role="status" aria-live="polite">
@@ -2142,6 +2175,30 @@ function applyCategoryDisplay() {
   filterCards();
 }
 document.querySelectorAll('.digest-category').forEach(function (input) { input.addEventListener('change', applyCategoryDisplay); });
+const filterMenu = document.getElementById('filter-menu');
+const filterTrigger = document.getElementById('filter-trigger');
+const filterPopover = document.getElementById('filter-popover');
+function setFilterMenuOpen(open) {
+  filterPopover.hidden = !open;
+  filterTrigger.setAttribute('aria-expanded', String(open));
+}
+function updateFilterSummary() {
+  const selectedCount = document.querySelectorAll('.digest-category:checked').length;
+  const totalCount = document.querySelectorAll('.digest-category').length;
+  document.getElementById('filter-summary').textContent = selectedCount + '/' + totalCount + ' categories';
+}
+filterTrigger.addEventListener('click', function () {
+  setFilterMenuOpen(filterPopover.hidden);
+});
+document.addEventListener('click', function (event) {
+  if (!filterPopover.hidden && !filterMenu.contains(event.target)) setFilterMenuOpen(false);
+});
+document.addEventListener('keydown', function (event) {
+  if (event.key === 'Escape' && !filterPopover.hidden) {
+    setFilterMenuOpen(false);
+    filterTrigger.focus();
+  }
+});
 applyCategoryDisplay();
 function tierKey(score) {
   return score >= 7 ? 'high' : (score >= 5 ? 'medium' : 'low');
@@ -2309,6 +2366,7 @@ function filterCards() {
   });
 
   refreshVisibleCounts();
+  updateFilterSummary();
 }
 
 function refreshVisibleCounts() {
