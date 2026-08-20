@@ -360,6 +360,27 @@ def _fetch_listed_papers(
                     continue
                 raise
 
+    # arXiv's id_list API intermittently omits some listed IDs; retry any
+    # missing ones individually so the official listing count is honoured.
+    missing = [i for i in ids if i not in papers_by_id]
+    if missing:
+        print(f"  {len(missing)} listed paper(s) missing from the batch response; "
+              "retrying individually ...")
+        for i in missing:
+            try:
+                with _api_request_session():
+                    for result in client.results(arxiv.Search(id_list=[i], max_results=1)):
+                        item = _paper_from_result(
+                            result,
+                            categories,
+                            include_cross,
+                            include_replacements,
+                        )
+                        if item is not None:
+                            papers_by_id.setdefault(item["base_id"], item["paper"])
+            except Exception:
+                pass
+
     return [
         papers_by_id[paper_id]
         for paper_id in ids
@@ -620,7 +641,8 @@ def fetch_daily_batch(
                 "papers": papers,
                 "message": (
                     f"Official astro-ph listing: {len(resolved['ids'])} "
-                    f"entries for {_recent_date_label(target_date)}."
+                    f"entries for {_recent_date_label(target_date)} "
+                    f"(fetched {len(papers)})."
                 ),
             }
         except requests.exceptions.ProxyError:
@@ -649,7 +671,7 @@ def fetch_daily_batch(
             **resolved,
             "status": "ok",
             "papers": papers,
-            "message": f"API fallback for {target_date}: {len(papers)} papers.",
+            "message": f"API fallback (official listing unavailable) for {target_date}: {len(papers)} papers.",
         }
 
     # no_announcement / not_yet_available / deferred_or_lagging
