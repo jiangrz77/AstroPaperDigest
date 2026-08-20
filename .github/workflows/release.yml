@@ -29,11 +29,29 @@ jobs:
         working-directory: AstroPaperDigest
         run: ./release.sh
 
+      - name: Generate release notes with SHA-256 checksums
+        run: |
+          TAG="$(git describe --tags --abbrev=0)"
+          git tag -l --format='%(contents)' "$TAG" > /tmp/release-body.md
+          {
+            echo ""
+            echo "## Checksums (SHA-256)"
+            for f in AstroPaperDigest/dist/AstroPaperDigest-*.dmg \
+                     AstroPaperDigest/dist/AstroPaperDigest-v*.app.zip \
+                     AstroPaperDigest/dist/AstroPaperDigest-v*.source.zip; do
+              echo "- $(basename "$f")"
+              echo "  SHA256: $(shasum -a 256 "$f" | awk '{print $1}')"
+            done
+          } >> /tmp/release-body.md
+          cat /tmp/release-body.md
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: /tmp/release-body.md
           files: |
             AstroPaperDigest/dist/AstroPaperDigest-*.dmg
             AstroPaperDigest/dist/AstroPaperDigest-v*.app.zip
             AstroPaperDigest/dist/AstroPaperDigest-v*.source.zip
             AstroPaperDigest/dist/version.json
+            AstroPaperDigest/dist/SHA256SUMS

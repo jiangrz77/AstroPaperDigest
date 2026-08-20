@@ -49,6 +49,8 @@ cat > dist/version.json <<EOF
 }
 EOF
 
+shasum -a 256 "$SOURCE_ZIP" "$APP_ZIP" "$DMG" > dist/SHA256SUMS
+
 echo ""
 echo "Done! Artifacts in dist/:"
 echo "  $SOURCE_ZIP   SHA256: $SHA_SOURCE"
