@@ -2,22 +2,22 @@
 
 [Chinese Docs](README_zh.md)
 
-Automatically fetches, filters, and ranks daily astrophysics papers based on your research interests using LLM-powered relevance scoring. Comes with a local Web UI for browsing, date navigation, and personalized settings.
+Automatically fetches, filters, and ranks daily astrophysics papers based on your research interests using LLM-powered relevance scoring. Comes with a native desktop window for browsing, date navigation, and personalized settings.
 
 ## Features
 
 - **LLM ranking**: DeepSeek (or any OpenAI-compatible API) scores paper relevance 1-10
-- **Web UI**: Local web interface with date navigation, tiered browsing, and real-time filtering
+- **Desktop UI**: Native macOS window (WebKit) with date navigation, tiered browsing, and real-time filtering
 - **Setup wizard**: First-launch wizard for API key and research interests
 - **Dual output**: BibTeX entries + Markdown digest, organized by date
-- **macOS app**: Double-click to run, auto-opens browser
+- **macOS app**: Double-click to run, opens a native desktop window
 
 ## Quick Start
 
 > **Note:** Do not run from `~/Downloads/` — macOS blocks downloaded files. Move the project to a permanent location first (e.g., `~/Projects/`).
 
 1. Double-click **`Install.command`** — sets up Python environment and builds the app
-2. Double-click **`AstroPaperDigest.app`** — your browser opens automatically
+2. Double-click **`AstroPaperDigest.app`** — a native desktop window opens automatically
 
 > **macOS security prompt?** Go to **System Settings → Privacy & Security**, click **"Open Anyway"**. Only needed once.
 

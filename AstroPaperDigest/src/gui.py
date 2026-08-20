@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""AstroPaperDigest - Flask web interface with taste feedback.
+"""AstroPaperDigest - native desktop window backed by a local Flask server.
 
-Flow: .app launches this -> browser opens immediately with status page ->
-pipeline runs in background -> page auto-updates when done.
+Flow: .app launches this -> pywebview opens the status page in a desktop
+window -> pipeline runs in the background -> page auto-updates when done.
 """
 
 import argparse
+import fcntl
 import json
 import math
 import os
@@ -14,7 +15,6 @@ import signal
 import subprocess
 import sys
 import time
-import webbrowser
 from collections import deque
 from datetime import date, datetime
 from pathlib import Path
@@ -22,7 +22,10 @@ from queue import Empty, Queue
 from threading import Lock, Thread, Timer
 
 from flask import Flask, abort, jsonify, redirect, render_template_string, request
+from werkzeug.serving import make_server
 from werkzeug.utils import secure_filename
+
+import webview
 
 # Ensure working directory is the project root (for .app launches)
 _PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -52,46 +55,15 @@ _pipeline_started_at = None
 _pipeline_progress = {"stage": "", "done": 0, "total": 0, "message": ""}
 _pipeline_log = deque(maxlen=60)
 _pipeline_lock = Lock()
-_browser_clients = {}
-_browser_clients_lock = Lock()
-_browser_check_timer = None
+_desktop_window = None
+_server = None
+_run_lock_fh = None
 
-_BROWSER_CLIENT_TIMEOUT = 45.0
-_BROWSER_CLOSE_GRACE = 2.0
-_BROWSER_LIFECYCLE_SCRIPT = """
-<script>
-(() => {
-  const storageKey = "astroPaperDigestClientId";
-  let clientId;
-  try {
-    clientId = sessionStorage.getItem(storageKey);
-    if (!clientId) {
-      clientId = crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random()}`;
-      sessionStorage.setItem(storageKey, clientId);
-    }
-  } catch (_) {
-    clientId = `${Date.now()}-${Math.random()}`;
-  }
-
-  const endpoint = (action) =>
-    `/client/${action}?id=${encodeURIComponent(clientId)}`;
-  const heartbeat = () => fetch(endpoint("heartbeat"), {
-    method: "POST",
-    cache: "no-store",
-    keepalive: true
-  }).catch(() => {});
-
-  heartbeat();
-  const heartbeatTimer = setInterval(heartbeat, 10000);
-  addEventListener("pagehide", () => {
-    clearInterval(heartbeatTimer);
-    navigator.sendBeacon(endpoint("close"));
-  }, { once: true });
-})();
-</script>
-"""
+# Single-instance + run-info location.  fcntl.flock releases automatically on
+# process exit, so a crashed app never leaves a "live" lock behind.
+_APD_APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "AstroPaperDigest"
+_APD_LOCK_PATH = _APD_APP_SUPPORT_DIR / "apd.lock"
+_APD_RUN_INFO_PATH = _APD_APP_SUPPORT_DIR / "apd-run.json"
 
 # --- Update check state ---
 _update_state = {
@@ -365,8 +337,9 @@ def _download_update(url: str, version: str, expected_sha: str):
             _update_state.update({"status": "error", "error": f"Download failed: {e}"})
 
 
-def _terminate_server():
-    """Terminate Flask so the launcher exits and releases its port."""
+def _stop_pipeline_process():
+    """Terminate the background CLI pipeline if it is still running."""
+    global _pipeline_process
     process = _pipeline_process
     if process is not None and process.poll() is None:
         process.terminate()
@@ -375,37 +348,141 @@ def _terminate_server():
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
-    os.kill(os.getpid(), signal.SIGTERM)
+    _pipeline_process = None
 
 
-def _schedule_browser_check_locked(delay: float):
-    global _browser_check_timer
-    if _browser_check_timer is not None:
-        _browser_check_timer.cancel()
-    _browser_check_timer = Timer(delay, _check_browser_clients)
-    _browser_check_timer.daemon = True
-    _browser_check_timer.start()
+def _cleanup_run_files():
+    """Release the single-instance lock and remove the run-info file."""
+    global _run_lock_fh
+    try:
+        if _APD_RUN_INFO_PATH.exists():
+            _APD_RUN_INFO_PATH.unlink()
+    except OSError:
+        pass
+    if _run_lock_fh is not None:
+        try:
+            fcntl.flock(_run_lock_fh.fileno(), fcntl.LOCK_UN)
+            _run_lock_fh.close()
+        except OSError:
+            pass
+        _run_lock_fh = None
 
 
-def _check_browser_clients():
-    """Stop the server after all browser tabs close or disappear."""
-    global _browser_check_timer
-    with _browser_clients_lock:
-        cutoff = time.monotonic() - _BROWSER_CLIENT_TIMEOUT
-        stale_ids = [
-            client_id
-            for client_id, last_seen in _browser_clients.items()
-            if last_seen < cutoff
-        ]
-        for client_id in stale_ids:
-            _browser_clients.pop(client_id, None)
+def _shutdown_server():
+    """Stop HTTP server + pipeline and release the port.  Idempotent."""
+    global _server
+    _stop_pipeline_process()
+    if _server is not None:
+        try:
+            _server.shutdown()
+        except Exception:
+            pass
+        try:
+            _server.server_close()
+        except Exception:
+            pass
+        _server = None
+    _cleanup_run_files()
 
-        if _browser_clients:
-            _schedule_browser_check_locked(_BROWSER_CLIENT_TIMEOUT)
-            return
-        _browser_check_timer = None
 
-    _terminate_server()
+def _terminate_server():
+    """Shut the app down from a request thread (update/restart path)."""
+    window = _desktop_window
+    if window is not None:
+        try:
+            window.destroy()
+        except Exception:
+            pass
+    _shutdown_server()
+    # Safety net in case the pywebview GUI loop did not unwind promptly.
+    Timer(1.0, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+
+
+def _ensure_run_dir():
+    try:
+        _APD_APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+
+def _read_run_info():
+    try:
+        with open(_APD_RUN_INFO_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_run_info(port: int):
+    _ensure_run_dir()
+    payload = {
+        "pid": os.getpid(),
+        "port": port,
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    tmp_path = _APD_RUN_INFO_PATH.with_suffix(".json.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    os.replace(tmp_path, _APD_RUN_INFO_PATH)
+
+
+def _acquire_single_instance_lock() -> bool:
+    """Try to become the single running instance.  Returns False if one exists."""
+    global _run_lock_fh
+    _ensure_run_dir()
+    fh = open(_APD_LOCK_PATH, "a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return False
+    _run_lock_fh = fh
+    return True
+
+
+def _focus_existing_instance() -> bool:
+    """Ask the already-running instance to bring its window to the front.
+
+    The lock guarantees another instance is alive, but the first launch may
+    still be writing its run-info file.  Retry briefly before giving up.
+    """
+    import urllib.request
+    for _ in range(15):
+        info = _read_run_info()
+        port = info.get("port") if info else None
+        if port:
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/focus", timeout=2).read()
+                return True
+            except Exception:
+                pass
+        time.sleep(0.2)
+    return False
+
+
+def _handle_termination_signal(signum, frame):
+    """Release the port and run files when macOS/launcher sends SIGTERM/SIGINT."""
+    try:
+        _shutdown_server()
+    except Exception:
+        pass
+    sys.exit(0)
+
+
+@app.route("/focus", methods=["GET", "POST"])
+def focus_desktop_window():
+    """Bring the native pywebview window back to the front."""
+    window = _desktop_window
+    if window is not None:
+        try:
+            window.restore()
+        except Exception:
+            pass
+        try:
+            window.show()
+        except Exception:
+            pass
+    return "", 204
 
 
 def _needs_setup():
@@ -419,47 +496,20 @@ def check_setup():
     if (
         _needs_setup()
         and request.path != "/setup"
-        and not request.path.startswith(("/static", "/client/"))
+        and not request.path.startswith(("/static", "/focus"))
     ):
         return redirect("/setup")
 
 
 @app.after_request
-def add_browser_lifecycle(response):
-    """Attach lifecycle tracking to every rendered browser page."""
+def inject_update_banner(response):
+    """Attach the update banner to every rendered page."""
     if response.mimetype == "text/html":
         content = response.get_data(as_text=True)
         if "</body>" in content:
-            inject = f"{_UPDATE_BANNER_SCRIPT}\n{_BROWSER_LIFECYCLE_SCRIPT}\n</body>"
+            inject = f"{_UPDATE_BANNER_SCRIPT}\n</body>"
             response.set_data(content.replace("</body>", inject, 1))
     return response
-
-
-@app.route("/client/heartbeat", methods=["POST"])
-def browser_heartbeat():
-    client_id = request.args.get("id", "")
-    if not client_id:
-        return "", 400
-
-    with _browser_clients_lock:
-        _browser_clients[client_id] = time.monotonic()
-        _schedule_browser_check_locked(_BROWSER_CLIENT_TIMEOUT)
-    return "", 204
-
-
-@app.route("/client/close", methods=["POST"])
-def browser_close():
-    client_id = request.args.get("id", "")
-    if client_id:
-        with _browser_clients_lock:
-            _browser_clients.pop(client_id, None)
-            delay = (
-                _BROWSER_CLIENT_TIMEOUT
-                if _browser_clients
-                else _BROWSER_CLOSE_GRACE
-            )
-            _schedule_browser_check_locked(delay)
-    return "", 204
 
 
 def load_preferences() -> dict:
@@ -2483,28 +2533,65 @@ def update_apply():
     return jsonify({"ok": True, "message": "Installation started. The app will restart shortly."})
 
 
-def open_browser(port: int = 5123):
-    """Open in Chrome on macOS (launches Chrome if not running)."""
-    import platform
-    url = f"http://127.0.0.1:{port}"
-    if platform.system() == "Darwin":
-        chrome = "/Applications/Google Chrome.app"
-        if os.path.exists(chrome):
-            subprocess.run(["open", "-a", "Google Chrome", url], capture_output=True)
-        else:
-            subprocess.run(["open", url], capture_output=True)
-    else:
-        webbrowser.open(url)
+def _create_server(port: int):
+    """Create a loopback HTTP server.  port=0 asks macOS for a free port."""
+    return make_server("127.0.0.1", port or 0, app, threaded=True)
+
+
+def _start_serving(server):
+    """Serve Flask from a daemon thread so pywebview can own the main thread."""
+    global _server
+    _server = server
+    thread = Thread(target=server.serve_forever, name="apd-http", daemon=True)
+    thread.start()
+    return thread
+
+
+def _run_desktop(server):
+    """Open the native pywebview window and block until the user closes it."""
+    global _desktop_window
+    _write_run_info(server.server_port)
+    url = f"http://127.0.0.1:{server.server_port}"
+    window = webview.create_window(
+        "AstroPaperDigest",
+        url,
+        width=1200,
+        height=820,
+        min_size=(960, 640),
+    )
+    _desktop_window = window
+    try:
+        webview.start()
+    finally:
+        _desktop_window = None
+        _shutdown_server()
 
 
 def main():
-    global _current_digest, _pipeline_message, _pipeline_status
+    global _current_digest, _pipeline_message, _pipeline_status, _server
 
-    parser = argparse.ArgumentParser(description="AstroPaperDigest Web Viewer")
-    parser.add_argument("--port", type=int, default=5123, help="Port (default: 5123)")
-    parser.add_argument("--no-browser", action="store_true", help="Don't auto-open browser")
+    parser = argparse.ArgumentParser(description="AstroPaperDigest desktop app")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Optional fixed loopback port (default: 0 = random free port)",
+    )
+    parser.add_argument("--no-window", action="store_true", help="Serve only; don't open the desktop window")
     parser.add_argument("--no-run", action="store_true", help="Don't auto-start pipeline")
     args = parser.parse_args()
+
+    signal.signal(signal.SIGTERM, _handle_termination_signal)
+    signal.signal(signal.SIGINT, _handle_termination_signal)
+
+    # Single instance: focus the existing window and exit instead of starting
+    # a second server on a new random port.
+    if not _acquire_single_instance_lock():
+        if _focus_existing_instance():
+            print("AstroPaperDigest is already running; focusing its window.")
+        else:
+            print("AstroPaperDigest appears to be running, but its window could not be focused.")
+        return
 
     # Load existing digest if available
     digest_path = get_latest_digest_path()
@@ -2530,12 +2617,23 @@ def main():
     if load_preferences().get("auto_check_updates", True):
         Thread(target=_start_update_check, daemon=True).start()
 
-    # Open browser
-    if not args.no_browser:
-        Timer(1.0, open_browser, args=[args.port]).start()
+    # Bind to 127.0.0.1 only; port 0 lets the OS choose a free port.
+    server = _create_server(args.port)
+    http_thread = _start_serving(server)
 
-    print(f"Server: http://127.0.0.1:{args.port}")
-    app.run(host="127.0.0.1", port=args.port, debug=False)
+    if args.no_window:
+        _write_run_info(server.server_port)
+        print(f"Server: http://127.0.0.1:{server.server_port}")
+        try:
+            http_thread.join()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            _shutdown_server()
+        return
+
+    print(f"Server: http://127.0.0.1:{server.server_port}")
+    _run_desktop(server)
 
 
 if __name__ == "__main__":

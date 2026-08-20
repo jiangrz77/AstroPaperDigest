@@ -316,7 +316,7 @@ def apply_update(version: str, zip_path: Path, log) -> dict:
     if sys.platform == "darwin":
         app_path = _PROJECT_DIR.parent / "AstroPaperDigest.app"
         if app_path.exists():
-            time.sleep(3)  # let the old server release port 5123
+            time.sleep(3)  # let the old process exit and release its resources
             subprocess.Popen(["open", str(app_path)])
             log(f"Restarted {app_path.name}")
             relaunched = True

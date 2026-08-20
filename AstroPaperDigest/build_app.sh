@@ -58,7 +58,7 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>LSUIElement</key>
-    <true/>
+    <false/>
 </dict>
 </plist>
 EOF
@@ -67,7 +67,8 @@ EOF
 cat > "$APP_DIR/Contents/MacOS/$APP_NAME" << 'LAUNCHER'
 #!/bin/bash
 # AstroPaperDigest - macOS App Launcher
-# Double-click to run the full pipeline
+# Starts gui.py, which owns the pywebview window, random loopback port,
+# single-instance handling and clean shutdown.
 
 # macOS .app launches with minimal PATH - fix it
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$PATH"
@@ -91,9 +92,9 @@ PROJECT_DIR="$(cd "$APP_DIR/../AstroPaperDigest" && pwd)"
 
 cd "$PROJECT_DIR"
 
-# Detect Python: prefer .venv, then venv, then system python3
-# On first run (or if venv is broken/moved/wrong arch), create .venv and install dependencies
-if ! "$PROJECT_DIR/.venv/bin/python3" -c "import pydantic" 2>/dev/null; then
+# Detect Python: prefer .venv, then venv, then system python3.
+# On first run (or if venv is broken/moved/wrong arch/missing new deps), recreate it.
+if ! "$PROJECT_DIR/.venv/bin/python3" -c "import pydantic, webview" 2>/dev/null; then
     rm -rf "$PROJECT_DIR/.venv"
     osascript -e 'display notification "Setting up Python environment..." with title "AstroPaperDigest"'
     python3 -m venv "$PROJECT_DIR/.venv"
@@ -109,67 +110,18 @@ else
     PYTHON_BIN="python3"
 fi
 
-# Check if server is already running on port 5123
-echo "Checking for existing server..."
-STATUS_RESPONSE=$(curl -fsSL --connect-timeout 2 http://127.0.0.1:5123/status 2>/dev/null || true)
-if echo "$STATUS_RESPONSE" | grep -q '"app":"AstroPaperDigest"'; then
-    echo "AstroPaperDigest is already running. Opening browser..."
-    osascript -e 'display notification "AstroPaperDigest is already running." with title "AstroPaperDigest"' 2>/dev/null
-    open "http://127.0.0.1:5123"
-    exit 0
-fi
+# gui.py handles single-instance focus, ephemeral loopback port, window close
+# and port release.  No fixed port, lsof or browser-opening logic belongs here.
+"$PYTHON_BIN" "$PROJECT_DIR/src/gui.py" &
+APP_PID=$!
 
-# Never kill an unrelated process that owns the configured port
-EXISTING_PID=$(lsof -ti :5123 2>/dev/null)
-if [ -n "$EXISTING_PID" ]; then
-    # A server still on the first-run setup page answers /status with a
-    # redirect, so recognise it as our own instance instead of a port conflict.
-    if ps -p "$EXISTING_PID" -o command= 2>/dev/null | grep -q "src/gui.py"; then
-        echo "AstroPaperDigest is already running (setup pending). Opening browser..."
-        open "http://127.0.0.1:5123"
-        exit 0
-    fi
-    echo "ERROR: Port 5123 is used by another process (PID: $EXISTING_PID)."
-    osascript -e 'display alert "AstroPaperDigest could not start" message "Port 5123 is being used by another application."' 2>/dev/null
-    exit 1
-fi
+# If this launcher exits or is killed (e.g. the app is quit), take the app
+# process down with it so the port is never left orphaned.
+trap 'kill "$APP_PID" 2>/dev/null' EXIT
 
-# Start Flask in background
-"$PYTHON_BIN" "$PROJECT_DIR/src/gui.py" --no-browser &
-FLASK_PID=$!
+echo "AstroPaperDigest starting (PID: $APP_PID)..."
 
-# If this launcher exits or is killed (e.g. the app is quit), take Flask down
-# with it so the port is never left orphaned.
-trap 'kill "$FLASK_PID" 2>/dev/null' EXIT
-
-echo "Flask starting (PID: $FLASK_PID)..."
-
-# Wait for server to be ready, then open browser
-SERVER_READY=0
-for i in $(seq 1 30); do
-    sleep 1
-    if "$PYTHON_BIN" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5123', timeout=2)" 2>/dev/null; then
-        SERVER_READY=1
-        echo "Server ready after ${i}s"
-        break
-    fi
-    if command -v curl >/dev/null 2>&1 && curl -s -o /dev/null http://127.0.0.1:5123 2>/dev/null; then
-        SERVER_READY=1
-        echo "Server ready after ${i}s (curl)"
-        break
-    fi
-done
-
-if [ $SERVER_READY -eq 1 ]; then
-    echo "Opening browser..."
-    open "http://127.0.0.1:5123"
-else
-    echo "WARNING: Server didn't start within 30s, trying to open browser anyway..."
-    open "http://127.0.0.1:5123"
-fi
-
-# Keep app alive while Flask runs
-wait $FLASK_PID
+wait "$APP_PID"
 LAUNCHER
 
 chmod +x "$APP_DIR/Contents/MacOS/$APP_NAME"
