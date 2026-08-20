@@ -162,6 +162,7 @@ def normalize_release(data: dict) -> dict:
         "download_url": download_url,
         "sha256": sha256,
         "prerelease": bool(data.get("prerelease")),
+        "has_update_package": bool(exact),
     }
 
 
@@ -208,6 +209,24 @@ def check_update(repo: str, current: str | None = None) -> dict:
             "sha256": release["sha256"],
             "published_at": release["published_at"],
             "error": None,
+        }
+
+    # Both channels can only update from their own update package
+    # (.app.zip for the bundled app, .source.zip for the source channel).
+    # dmg-only releases ship no update package; do not offer a download that
+    # would fail to install.
+    if not release.get("has_update_package"):
+        return {
+            "available": False,
+            "current": current,
+            "latest": release["version"],
+            "tag": release["tag"],
+            "notes": release["notes"],
+            "download_url": "",
+            "sha256": None,
+            "published_at": release["published_at"],
+            "error": "A newer version is available on GitHub Releases; in-app "
+                     "updates are not enabled for this release channel.",
         }
     return {
         "available": is_newer(release["version"], current),
