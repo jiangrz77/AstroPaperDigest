@@ -1706,6 +1706,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .btn-refresh{background:#3498db;color:#fff}.btn-refresh:hover{background:#2980b9}
 .btn-nav{background:#ecf0f1;color:#555}.btn-nav:hover{background:#dfe6e9}
 .paper-total{display:inline-flex;align-items:center;height:32px;padding:0 10px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;color:#64748b;font-size:12px;font-weight:600;white-space:nowrap}
+.btn-nav-star{background:#fff;border:1px solid currentColor}.btn-nav-star:hover{background:#f8fafc}
+.nav-star-5{color:#f4b400}.nav-star-4{color:#27ae60}.nav-star-3,.nav-star-2{color:#2563eb}.nav-star-1{color:#95a5a6}
 .date-display{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;font-size:16px;font-weight:600;color:#fff;cursor:default;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);line-height:1}
 .date-arrow{display:inline-flex;align-items:center;justify-content:center;height:34px;width:34px;padding:0;box-sizing:border-box;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;cursor:default;font-size:15px;line-height:1;opacity:.5}
 .btn-today{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;line-height:1}
@@ -1747,9 +1749,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 <div class="toolbar">
   <button class="btn-refresh" disabled style="opacity:.6" title="Running...">&#x21bb;</button>
-  <button class="btn-nav" style="opacity:.5" aria-label="Five-star papers">★★★★★ (...)</button>
-  <button class="btn-nav" style="opacity:.5" aria-label="Four-star papers">★★★★ (...)</button>
-  <button class="btn-nav" style="opacity:.5" aria-label="Two- to three-star papers">★★★/★★ (...)</button>
+  <button class="btn-nav btn-nav-star nav-star-5" style="opacity:.5" aria-label="Five-star papers">★★★★★ (...)</button>
+  <button class="btn-nav btn-nav-star nav-star-4" style="opacity:.5" aria-label="Four-star papers">★★★★ (...)</button>
+  <button class="btn-nav btn-nav-star nav-star-3" style="opacity:.5" aria-label="Three-star papers">★★★ (...)</button>
+  <button class="btn-nav btn-nav-star nav-star-2" style="opacity:.5" aria-label="Two-star papers">★★ (...)</button>
+  <button class="btn-nav btn-nav-star nav-star-1" style="opacity:.5" aria-label="One-star papers">★ (...)</button>
 </div>
 </div>
 <div class="loading-area">
@@ -1980,6 +1984,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .btn-nav{background:#ecf0f1;color:#555}.btn-nav:hover{background:#dfe6e9}
 .btn-nav-active{background:#2c3e50;color:#fff}
 .paper-total{display:inline-flex;align-items:center;height:32px;padding:0 10px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;color:#64748b;font-size:12px;font-weight:600;white-space:nowrap}
+.btn-nav-star{background:#fff;border:1px solid currentColor}.btn-nav-star:hover{background:#f8fafc}
+.nav-star-5{color:#f4b400}.nav-star-4{color:#27ae60}.nav-star-3,.nav-star-2{color:#2563eb}.nav-star-1{color:#95a5a6}
 .scope-banner{display:none;align-items:center;gap:12px;padding:7px 32px;background:#eff6ff;border-bottom:1px solid #bfdbfe;color:#1e3a5f;font-size:12px;line-height:1.4}
 .scope-banner-text{min-width:0;flex:1}
 .scope-banner-actions{display:flex;align-items:center;gap:10px;white-space:nowrap;margin-left:auto;color:#476581}
@@ -2069,9 +2075,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="toolbar">
   <button class="btn-refresh" onclick="rerunWithPrefs()" title="Re-run pipeline" style="font-size:18px">&#x21bb;</button>
   <span class="paper-total stats" aria-label="Displayed paper count">{{ digest.total_papers }} papers</span>
-  {% for tier in digest.tiers %}
-  {% if 'Strongly' in tier.name or 'Highly' in tier.name or 'Possibly' in tier.name %}<button class="btn-nav" aria-label="{{ tier.name }}" data-tier-key="{% if 'Strongly' in tier.name %}strong{% elif 'Highly' in tier.name %}high{% else %}medium{% endif %}" data-tier-idx="{{ loop.index0 }}" onclick="document.getElementById('tier-{{ loop.index }}').scrollIntoView({behavior:'smooth'})">{% if 'Strongly' in tier.name %}★★★★★{% elif 'Highly' in tier.name %}★★★★{% else %}★★★/★★{% endif %} (<span class="btn-tier-count">{{ tier.papers|length }}</span>)</button>{% endif %}
-  {% endfor %}
+  {% for star in (5, 4, 3, 2, 1) %}<button class="btn-nav btn-nav-star nav-star-{{ star }}" data-score-nav="{{ star }}" aria-label="{{ star }}-star papers" onclick="scrollToScore({{ star }})">{{ '★' * star }} (<span class="btn-score-count">{{ score_counts.get(star, 0) }}</span>)</button>{% endfor %}
   <div class="filter-menu" id="filter-menu">
     <button class="btn-filter" type="button" id="filter-trigger" aria-expanded="false" aria-controls="filter-popover">
       <span>Filters</span><span class="filter-summary" id="filter-summary"></span><span class="filter-chevron" aria-hidden="true">⌄</span>
@@ -2207,6 +2211,12 @@ document.addEventListener('keydown', function (event) {
   }
 });
 applyCategoryDisplay();
+function scrollToScore(score) {
+  const card = Array.from(document.querySelectorAll('.card')).find(function (item) {
+    return Number(item.dataset.score || 0) === score && item.style.display !== 'none';
+  });
+  if (card) card.scrollIntoView({behavior:'smooth', block:'start'});
+}
 function tierKey(score) {
   return score === 5 ? 'strong' : (score === 4 ? 'high' : (score >= 2 ? 'medium' : 'low'));
 }
@@ -2394,8 +2404,15 @@ function refreshVisibleCounts() {
     const countEl = tier.querySelector('.tier-count');
     if (countEl) countEl.textContent = visibleCount;
     tier.style.display = visibleCount ? '' : 'none';
-    const btnCount = document.querySelector(`.btn-nav[data-tier-key="${tier.dataset.tier}"] .btn-tier-count`);
-    if (btnCount) btnCount.textContent = visibleCount;
+  });
+
+  document.querySelectorAll('.btn-score-count').forEach(function (countEl) {
+    const button = countEl.closest('[data-score-nav]');
+    const score = button ? Number(button.dataset.scoreNav) : 0;
+    const visibleCount = Array.from(document.querySelectorAll('.card')).filter(function (card) {
+      return Number(card.dataset.score || 0) === score && card.style.display !== 'none';
+    }).length;
+    countEl.textContent = visibleCount;
   });
 
   // Keep the header summary in sync with the cards actually visible after
@@ -2748,6 +2765,14 @@ def _render_digest(digest=None):
     prefs = load_preferences()
     cfg, _ = _load_config_and_env()
     apply_to_digest(d, d.get("date", today_str))
+    score_counts = {
+        star: sum(
+            1 for tier in d.get("tiers", [])
+            for paper in tier.get("papers", [])
+            if not paper.get("scoring_failed") and int(paper.get("score", 0) or 0) == star
+        )
+        for star in (5, 4, 3, 2, 1)
+    }
     today_str = _digest_today_str()
     full_abstracts = _load_full_abstracts(d.get("date", ""))
     # Older digests store 300-char snippets that can cut a LaTeX formula in
@@ -2766,6 +2791,7 @@ def _render_digest(digest=None):
         today_str=today_str,
         full_abstracts=full_abstracts,
         star_display=_star_display,
+        score_counts=score_counts,
     )
 
 
