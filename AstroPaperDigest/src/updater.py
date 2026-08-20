@@ -67,7 +67,26 @@ class UpdateApplyError(Exception):
 # ---------------------------------------------------------------------------
 
 def get_current_version() -> str:
-    """Read the single source of truth (version.txt)."""
+    """Return the installed version.
+
+    Frozen builds: prefer CFBundleShortVersionString from the bundle's
+    Info.plist (version.txt in the data dir is only written after an update).
+    Source builds: read version.txt from the repo root.
+    """
+    if getattr(sys, "frozen", False):
+        try:
+            import plistlib
+
+            exe = Path(sys.executable).resolve()
+            plist_path = exe.parent.parent.parent / "Contents" / "Info.plist"
+            if plist_path.exists():
+                with open(plist_path, "rb") as f:
+                    info = plistlib.load(f)
+                v = str(info.get("CFBundleShortVersionString") or "").strip()
+                if v and v != "0.0.0":
+                    return v
+        except Exception:
+            pass
     try:
         v = VERSION_FILE.read_text(encoding="utf-8").strip()
         if v:
