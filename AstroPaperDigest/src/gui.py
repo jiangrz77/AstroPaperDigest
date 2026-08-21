@@ -2117,6 +2117,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .tier-marginal{color:#95a5a6;border-color:#95a5a6}
 .card{background:#fff;border-radius:10px;padding:18px 20px;margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,.08);transition:box-shadow .2s}
 .card:hover{box-shadow:0 3px 12px rgba(0,0,0,.12)}
+.search-empty{padding:56px 20px;color:#94a3b8;font-size:14px;text-align:center}
 .card-title{font-size:15px;font-weight:600;color:#2c3e50;margin-bottom:6px;display:flex;align-items:flex-start;gap:10px}
 .score-badge{display:inline-block;min-width:82px;text-align:center;padding:3px 8px;border-radius:12px;background:#fff;font-size:15px;font-weight:700;letter-spacing:1px;line-height:1;color:#cbd5e1;flex-shrink:0}
 .score-strong{color:#f4b400}.score-high{color:#27ae60}.score-three{color:#2563eb}.score-two{color:#8b5cf6}.score-low{color:#95a5a6}.score-failed{background:#dc2626;color:#fff;font-size:12px;letter-spacing:0}
@@ -2142,6 +2143,22 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .btn-order-refresh:hover{background:#eff6ff;transform:translateY(-2px);box-shadow:0 7px 18px rgba(37,99,235,.28)}
 .btn-order-refresh:focus-visible{outline:3px solid rgba(37,99,235,.3);outline-offset:2px}
 .filter-menu{position:relative;margin-left:auto}
+.search-control{position:relative;display:inline-flex;align-items:center}
+.search-control input{width:210px;height:36px;box-sizing:border-box;padding:0 68px 0 11px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#334155;font-size:13px;line-height:1;outline:none}
+.search-control input::placeholder{color:#94a3b8}
+.search-control input:focus{border-color:#93c5fd;box-shadow:0 0 0 2px rgba(147,197,253,.25)}
+.search-control input::-webkit-search-cancel-button{display:none}
+.search-clear{position:absolute;right:7px;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border:0;border-radius:50%;background:transparent;color:#64748b;font-size:18px;line-height:1;cursor:pointer}
+.search-clear:hover{background:#f1f5f9;color:#334155}
+.search-clear[hidden]{display:none}
+.search-nav-buttons{position:absolute;right:31px;display:inline-flex;align-items:center;gap:0}
+.search-nav-buttons[hidden],#search-nav-buttons[hidden]{display:none!important}
+.search-nav-button{display:inline-flex;align-items:center;justify-content:center;width:13px;height:18px;padding:0;border:0;border-radius:3px;background:transparent;color:#64748b;font-size:11px;line-height:1;cursor:pointer}
+.search-nav-button:hover{background:#f1f5f9;color:#1d4ed8}
+.search-nav-button:disabled{opacity:.35;cursor:default;background:transparent;color:#94a3b8}
+.search-nav-button:focus-visible{outline:2px solid #93c5fd;outline-offset:1px}
+.search-match{background:#ffd54f!important;color:#1f2937!important;border-radius:3px;padding:0 2px;box-shadow:0 0 0 1px rgba(180,130,0,.18)}
+.search-current{outline:2px solid #93c5fd;outline-offset:3px;box-shadow:0 0 0 5px rgba(147,197,253,.16)}
 .btn-filter{height:36px;display:flex;align-items:center;gap:7px;padding:0 11px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#334155;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
 .btn-filter:hover,.btn-filter[aria-expanded="true"]{border-color:#93c5fd;background:#eff6ff;color:#1d4ed8}
 .filter-summary{color:#64748b;font-size:12px;font-weight:500}
@@ -2169,7 +2186,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .scope-toggle span{display:flex;align-items:center;justify-content:center;min-height:34px;padding:0 9px;border:1px solid #d1d5db;border-radius:7px;background:#fff;color:#475569;font-size:12px;font-weight:600;text-align:center;transition:background .14s ease,border-color .14s ease,color .14s ease}
 .scope-toggle:hover span{border-color:#93c5fd;color:#1d4ed8}
 .scope-toggle input:checked+span{border-color:#1d4ed8;background:#dbeafe;color:#1d4ed8}
-@media(max-width:760px){.filter-menu{margin-left:0}.filter-popover{left:0;right:auto;max-width:calc(100vw - 32px)}}
+@media(max-width:760px){.filter-menu{margin-left:0}.search-control input{width:190px}.filter-popover{left:0;right:auto;max-width:calc(100vw - 32px)}}
 .date-display{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;font-size:16px;font-weight:600;color:#fff;cursor:pointer;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);line-height:1;user-select:none}
 .date-display:hover{background:rgba(255,255,255,.2)}
 .date-arrow{display:inline-flex;align-items:center;justify-content:center;height:34px;width:34px;padding:0;box-sizing:border-box;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:15px;line-height:1}
@@ -2201,6 +2218,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   <button class="btn-refresh" onclick="rerunWithPrefs()" title="Regenerate digest">Regenerate</button>
   <span class="paper-total stats" aria-label="Displayed paper count">{{ digest.total_papers }} papers</span>
   {% for star in (5, 4, 3, 2, 1) %}<button class="btn-nav btn-nav-star nav-star-{{ star }}" data-score-nav="{{ star }}" aria-label="{{ star }}-star papers" onclick="scrollToScore({{ star }})">{{ '★' * star }} (<span class="btn-score-count">{{ score_counts.get(star, 0) }}</span>)</button>{% endfor %}
+  <div class="search-control" id="search-control">
+    <input type="search" id="digest-search" placeholder="Search papers" aria-label="Search papers by title, author, abstract, arXiv ID, or category">
+    <div class="search-nav-buttons" id="search-nav-buttons" aria-label="Search result navigation" hidden>
+      <button class="search-nav-button" id="search-prev" type="button" aria-label="Previous matching paper" title="Previous match (Shift+Enter)" disabled>&#8593;</button>
+      <button class="search-nav-button" id="search-next" type="button" aria-label="Next matching paper" title="Next match (Enter)" disabled>&#8595;</button>
+    </div>
+    <button class="search-clear" id="search-clear" type="button" hidden aria-label="Clear search">&times;</button>
+  </div>
   <div class="filter-menu" id="filter-menu">
     <button class="btn-filter" type="button" id="filter-trigger" aria-expanded="false" aria-controls="filter-popover">
       <span>Filters</span><span class="filter-summary" id="filter-summary"></span><span class="filter-chevron" aria-hidden="true"></span>
@@ -2236,12 +2261,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 </div>
 <div class="container">
+<div class="search-empty" id="search-empty" hidden>No matching papers</div>
 {% for tier in digest.tiers %}
   <div class="tier-header {% if 'Strongly' in tier.name %}tier-strongly{% elif 'Highly' in tier.name %}tier-highly{% elif 'Possibly' in tier.name %}tier-possibly{% else %}tier-marginal{% endif %}" id="tier-{{ loop.index }}" data-tier="{% if 'Strongly' in tier.name %}strong{% elif 'Highly' in tier.name %}high{% elif 'Possibly' in tier.name %}medium{% else %}low{% endif %}">
     <h2><span class="tier-name-text">{{ tier.name }}</span> (<span class="tier-count">{{ tier.papers|length }}</span>)</h2>
   </div>
   {% for paper in tier.papers %}
-  <div class="card" id="card-{{ paper.paper_id | replace('.', '-') }}" data-paper-type="{{ paper.paper_type | default('new') }}" data-categories="{{ paper.categories }}" data-base-score="{{ paper.base_score | default(paper.score) }}" data-score="{{ paper.score }}">
+  <div class="card" id="card-{{ paper.paper_id | replace('.', '-') }}" data-paper-type="{{ paper.paper_type | default('new') }}" data-categories="{{ paper.categories }}" data-search-title="{{ paper.title }}" data-search-authors="{{ paper.authors }}" data-search-abstract="{{ full_abstracts.get(paper.paper_id, paper.abstract) }}" data-search-id="{{ paper.paper_id }}" data-search-categories="{{ paper.categories }}" data-base-score="{{ paper.base_score | default(paper.score) }}" data-score="{{ paper.score }}">
     <div class="card-title">
       {% if paper.scoring_failed %}
       <span class="score-badge score-failed">No score</span>
@@ -2359,6 +2385,172 @@ function updateFilterSummary() {
   const totalCount = document.querySelectorAll('.digest-category').length;
   document.getElementById('filter-summary').textContent = selectedCount + '/' + totalCount + ' categories';
 }
+const digestSearch = document.getElementById('digest-search');
+const searchClear = document.getElementById('search-clear');
+const searchPrevious = document.getElementById('search-prev');
+const searchNext = document.getElementById('search-next');
+const searchNavButtons = document.getElementById('search-nav-buttons');
+function searchTokens() {
+  if (!digestSearch) return [];
+  return digestSearch.value.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+}
+function cardMatchesSearch(card) {
+  const tokens = searchTokens();
+  if (!tokens.length) return true;
+  const searchable = [
+    card.dataset.searchTitle,
+    card.dataset.searchAuthors,
+    card.dataset.searchAbstract,
+    card.dataset.searchId,
+    card.dataset.searchCategories
+  ].join(' ').toLocaleLowerCase();
+  return tokens.every(function (token) { return searchable.indexOf(token) >= 0; });
+}
+let searchMatchCards = [];
+let searchMatchIndex = -1;
+function escapeSearchToken(token) {
+  return token.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+}
+function clearSearchHighlights() {
+  document.querySelectorAll('.search-match').forEach(function (mark) {
+    mark.replaceWith(document.createTextNode(mark.textContent));
+  });
+  document.querySelectorAll('.card-abstract.search-auto-expanded').forEach(function (abstract) {
+    abstract.classList.remove('expanded', 'search-auto-expanded');
+    const toggle = document.querySelector('.abstract-toggle[data-target="' + abstract.id + '"]');
+    if (toggle) toggle.innerHTML = 'Show more &#9660;';
+  });
+}
+function escapeSearchTokenSafe(token) {
+  const specials = '.^$*+?()[]{}|';
+  const slash = String.fromCharCode(92);
+  return token.split('').map(function (character) {
+    return specials.indexOf(character) >= 0 ? slash + character : character;
+  }).join('');
+}
+function collectSearchTextNodes(node, nodes) {
+  Array.from(node.childNodes || []).forEach(function (child) {
+    if (child.nodeType === 3) {
+      if (child.nodeValue.trim()) nodes.push(child);
+      return;
+    }
+    if (child.nodeType !== 1 || (child.matches && child.matches('mjx-container,script,style'))) return;
+    collectSearchTextNodes(child, nodes);
+  });
+}
+function highlightSearchText(element, tokens) {
+  if (!element || !tokens.length) return;
+  const pattern = new RegExp('(' + tokens.map(escapeSearchTokenSafe).join('|') + ')', 'gi');
+  const source = element.textContent || '';
+  pattern.lastIndex = 0;
+  if (!pattern.test(source)) return;
+  pattern.lastIndex = 0;
+  const fragment = document.createDocumentFragment();
+  const parts = source.split(pattern);
+  parts.forEach(function (part, index) {
+    if (!part) return;
+    if (index % 2 === 1) {
+      const mark = document.createElement('mark');
+      mark.className = 'search-match';
+      mark.textContent = part;
+      fragment.appendChild(mark);
+    } else {
+      fragment.appendChild(document.createTextNode(part));
+    }
+  });
+  while (element.firstChild) element.removeChild(element.firstChild);
+  element.appendChild(fragment);
+}
+function expandAbstractForSearch(card, tokens) {
+  const abstract = card.querySelector('.card-abstract');
+  if (!abstract || abstract.classList.contains('expanded')) return;
+  const source = (abstract.textContent || '').toLocaleLowerCase();
+  if (!tokens.some(function (token) { return source.indexOf(token) >= 0; })) return;
+  abstract.classList.add('expanded', 'search-auto-expanded');
+  const toggle = card.querySelector('.abstract-toggle');
+  if (toggle) toggle.innerHTML = 'Show less &#9650;';
+}
+function refreshSearchMatches() {
+  clearSearchHighlights();
+  document.querySelectorAll('.search-current').forEach(function (card) { card.classList.remove('search-current'); });
+  searchMatchCards = [];
+  searchMatchIndex = -1;
+  const tokens = searchTokens();
+  const empty = document.getElementById('search-empty');
+  if (!tokens.length) {
+    if (empty) empty.hidden = true;
+    syncSearchControl();
+    return;
+  }
+  document.querySelectorAll('.card').forEach(function (card) {
+    if (card.style.display === 'none' || !cardMatchesSearch(card)) return;
+    [
+      card.querySelector('.card-title > span:last-child'),
+      card.querySelector('.card-meta'),
+      card.querySelector('.card-abstract'),
+      card.querySelector('.card-actions a')
+    ].forEach(function (element) { highlightSearchText(element, tokens); });
+    searchMatchCards.push(card);
+  });
+  if (empty) empty.hidden = searchMatchCards.length > 0;
+  syncSearchControl();
+}
+function goToSearchMatch(direction) {
+  if (!searchMatchCards.length) return;
+  const current = document.querySelector('.search-current');
+  const currentIndex = current ? searchMatchCards.indexOf(current) : -1;
+  if (currentIndex < 0) {
+    searchMatchIndex = direction > 0 ? 0 : searchMatchCards.length - 1;
+  } else {
+    searchMatchIndex = (currentIndex + direction + searchMatchCards.length) % searchMatchCards.length;
+  }
+  if (current && current !== searchMatchCards[searchMatchIndex]) {
+    const previousAbstract = current.querySelector('.card-abstract.search-auto-expanded');
+    if (previousAbstract) {
+      previousAbstract.classList.remove('expanded', 'search-auto-expanded');
+      const previousToggle = current.querySelector('.abstract-toggle');
+      if (previousToggle) previousToggle.innerHTML = 'Show more &#9660;';
+    }
+  }
+  searchMatchCards.forEach(function (card) { card.classList.remove('search-current'); });
+  const card = searchMatchCards[searchMatchIndex];
+  card.classList.add('search-current');
+  expandAbstractForSearch(card, searchTokens());
+  const sticky = document.querySelector('.sticky-wrapper');
+  const offset = sticky ? sticky.getBoundingClientRect().height + 12 : 12;
+  const top = card.getBoundingClientRect().top + window.scrollY - offset;
+  window.scrollTo({top: Math.max(0, top), behavior:'smooth'});
+}
+function syncSearchControl() {
+  const hasSearch = Boolean(digestSearch && digestSearch.value.trim());
+  if (searchClear) searchClear.hidden = !hasSearch;
+  if (searchNavButtons) searchNavButtons.hidden = !hasSearch;
+  const disabled = !hasSearch || !searchMatchCards.length;
+  if (searchPrevious) searchPrevious.disabled = disabled;
+  if (searchNext) searchNext.disabled = disabled;
+}
+function handleDigestSearchInput() {
+  syncSearchControl();
+  filterCards();
+}
+if (digestSearch) {
+  digestSearch.addEventListener('input', handleDigestSearchInput);
+  digestSearch.addEventListener('change', handleDigestSearchInput);
+  digestSearch.addEventListener('paste', function () { window.setTimeout(handleDigestSearchInput, 0); });
+}
+if (searchClear) searchClear.addEventListener('click', function () {
+  if (!digestSearch) return;
+  digestSearch.value = '';
+  syncSearchControl();
+  filterCards();
+  digestSearch.focus();
+});
+function navigateFromSearchButton(direction) {
+  goToSearchMatch(direction);
+  if (digestSearch) digestSearch.focus();
+}
+if (searchPrevious) searchPrevious.addEventListener('click', function () { navigateFromSearchButton(-1); });
+if (searchNext) searchNext.addEventListener('click', function () { navigateFromSearchButton(1); });
 filterTrigger.addEventListener('click', function () {
   setFilterMenuOpen(filterPopover.hidden);
 });
@@ -2366,6 +2558,35 @@ document.addEventListener('click', function (event) {
   if (!filterPopover.hidden && !filterMenu.contains(event.target)) setFilterMenuOpen(false);
 });
 document.addEventListener('keydown', function (event) {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f' && digestSearch) {
+    event.preventDefault();
+    event.stopPropagation();
+    digestSearch.focus();
+    digestSearch.select();
+    return;
+  }
+  if (digestSearch && document.activeElement === digestSearch && searchTokens().length) {
+    if (event.key === 'ArrowDown' || (event.key === 'Enter' && !event.shiftKey)) {
+      event.preventDefault();
+      event.stopPropagation();
+      goToSearchMatch(1);
+      return;
+    }
+    if (event.key === 'ArrowUp' || (event.key === 'Enter' && event.shiftKey)) {
+      event.preventDefault();
+      event.stopPropagation();
+      goToSearchMatch(-1);
+      return;
+    }
+  }
+  if (event.key === 'Escape' && digestSearch && digestSearch.value.trim()) {
+    event.preventDefault();
+    event.stopPropagation();
+    digestSearch.value = '';
+    syncSearchControl();
+    filterCards();
+    return;
+  }
   if (event.key === 'Escape' && !filterPopover.hidden) {
     event.preventDefault();
     event.stopPropagation();
@@ -2571,11 +2792,12 @@ function filterCards() {
     .map(function (input) { return input.value; });
   
   const allCards = document.querySelectorAll('.card');
+  const searchActive = searchTokens().length > 0;
   
   allCards.forEach(card => {
     const type = card.dataset.paperType || 'new';
     const categories = String(card.dataset.categories || '').split(',').map(function (item) { return item.trim(); });
-    let show = selectedCategories.length > 0 && categories.some(function (category) {
+    let show = searchActive ? cardMatchesSearch(card) : selectedCategories.length > 0 && categories.some(function (category) {
       return selectedCategories.indexOf(category) >= 0;
     });
     
@@ -2587,6 +2809,7 @@ function filterCards() {
 
   refreshVisibleCounts();
   updateFilterSummary();
+  refreshSearchMatches();
 }
 
 function refreshVisibleCounts() {
@@ -2648,6 +2871,7 @@ function setupAbstractToggles() {
 function toggleAbstract(btn) {
   const el = document.getElementById(btn.dataset.target);
   if (!el) return;
+  el.classList.remove('search-auto-expanded');
   const expanded = el.classList.toggle('expanded');
   btn.innerHTML = expanded ? 'Show less &#9650;' : 'Show more &#9660;';
 }
