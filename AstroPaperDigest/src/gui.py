@@ -230,7 +230,7 @@ def _apply_llm(config: dict, env_values: dict, provider: str, api_key: str,
 def _apply_interests(config: dict, request) -> None:
     """Update paper categories and the selected research-profile source."""
     profile_mode = request.form.get("profile_mode", "quick")
-    categories = request.form.getlist("categories")
+    categories = _normalize_display_categories(request.form.getlist("categories"))
     # These categories set the default display filter in the digest.  They no
     # longer limit what is fetched or scored.
     config["arxiv_categories"] = categories
@@ -251,6 +251,25 @@ def _apply_interests(config: dict, request) -> None:
             config["bib_file"] = f"data/{filename}"
         elif bib_path:
             config["bib_file"] = bib_path
+
+
+def _normalize_display_categories(categories) -> list:
+    """Return valid display categories in the canonical order.
+
+    An empty selection is valid: it temporarily hides all papers until the
+    user selects a category or clicks All again.
+    """
+    selected = set(categories or [])
+    return [category for category in _DEFAULT_ARXIV_CATEGORIES if category in selected]
+
+
+def _save_display_categories(categories) -> list:
+    """Persist the Digest display-category selection shared by both UIs."""
+    config, _ = _load_config_and_env()
+    normalized = _normalize_display_categories(categories)
+    config["arxiv_categories"] = normalized
+    _write_config(config)
+    return normalized
 
 
 def _apply_email(config: dict, env_values: dict, enable_email: bool,
@@ -303,8 +322,8 @@ def _setup_context() -> dict:
             env_vars.get("OPENAI_API_KEY", env_vars.get("CUSTOM_API_KEY", "")),
         ),
         # New users start with the full astro-ph set; existing saved choices
-        # (including a deliberate GA-only scope) are preserved.
-        "cur_categories": cfg.get("arxiv_categories") or list(_DEFAULT_ARXIV_CATEGORIES),
+        # (including a deliberate empty selection) are preserved.
+        "cur_categories": cfg["arxiv_categories"] if "arxiv_categories" in cfg else list(_DEFAULT_ARXIV_CATEGORIES),
         "cur_keywords": ", ".join(cfg.get("keywords", [])),
         "cur_bib_file": cfg.get("bib_file", ""),
         "cur_email_sender": email_cfg.get("sender", ""),
@@ -1086,9 +1105,16 @@ label{display:block;font-size:13px;font-weight:600;color:#555;margin-bottom:6px;
 input[type="text"],input[type="password"],select,textarea{width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:6px;font-size:14px;margin-bottom:4px}
 input:focus,select:focus,textarea:focus{outline:none;border-color:#2563eb;box-shadow:0 0 0 2px rgba(37,99,235,.15)}
 textarea{height:80px;resize:vertical}
-.checkbox-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}
-.checkbox-grid label{display:flex;align-items:center;gap:6px;font-weight:400;font-size:13px;margin:0}
-.checkbox-grid input{width:auto}
+.category-pills{display:flex;align-items:center;gap:4px;flex-wrap:nowrap;overflow:visible;margin-top:10px;padding:1px 0 2px}
+.category-pills::-webkit-scrollbar{display:none}
+.category-pill{display:block;flex:0 0 auto;margin:0;cursor:pointer}
+.category-pill input{position:absolute;opacity:0;pointer-events:none}
+.category-pill span{display:flex;align-items:center;justify-content:center;box-sizing:border-box;height:24px;padding:0 7px;border:1px solid #d1d5db;border-radius:999px;background:#fff;color:#475569;font-size:11px;font-weight:600;line-height:1;white-space:nowrap;transition:background .14s ease,border-color .14s ease,color .14s ease;cursor:pointer}
+.category-all{display:flex;align-items:center;justify-content:center;box-sizing:border-box;height:24px;flex:0 0 auto;margin:0 3px 0 0;padding:0 8px;border:1px solid #cbd5e1;border-radius:7px;background:#f8fafc;color:#475569;font-family:inherit;font-size:11px;font-weight:700;line-height:1;white-space:nowrap;appearance:none;transition:background .14s ease,border-color .14s ease,color .14s ease;cursor:pointer}
+.category-pill:hover span{border-color:#93c5fd;color:#1d4ed8}
+.category-all:hover{border-color:#64748b;color:#1e293b}
+.category-pill input:checked+span{border-color:#2563eb;background:#2563eb;color:#fff}
+.category-all.active{border-color:#1e293b;background:#1e293b;color:#fff}
 .toggle-group{display:flex;gap:12px;margin-bottom:12px}
 .toggle-group label{display:flex;align-items:center;gap:6px;font-weight:500;margin:0;cursor:pointer}
 .toggle-group input{width:auto}
@@ -1126,13 +1152,14 @@ textarea{height:80px;resize:vertical}
     <h2><span class="step-num">2</span>Research Interests</h2>
     <h3 style="font-size:14px;color:#2c3e50;margin-bottom:4px">Paper Categories</h3>
     <p class="hint">All official astro-ph papers are included and scored in every daily digest. These choices set the categories shown by default in the Digest view.</p>
-    <div class="checkbox-grid">
-      <label><input type="checkbox" name="categories" value="astro-ph.GA" {% if 'astro-ph.GA' in cur_categories %}checked{% endif %}> astro-ph.GA</label>
-      <label><input type="checkbox" name="categories" value="astro-ph.SR" {% if 'astro-ph.SR' in cur_categories %}checked{% endif %}> astro-ph.SR</label>
-      <label><input type="checkbox" name="categories" value="astro-ph.HE" {% if 'astro-ph.HE' in cur_categories %}checked{% endif %}> astro-ph.HE</label>
-      <label><input type="checkbox" name="categories" value="astro-ph.CO" {% if 'astro-ph.CO' in cur_categories %}checked{% endif %}> astro-ph.CO</label>
-      <label><input type="checkbox" name="categories" value="astro-ph.IM" {% if 'astro-ph.IM' in cur_categories %}checked{% endif %}> astro-ph.IM</label>
-      <label><input type="checkbox" name="categories" value="astro-ph.EP" {% if 'astro-ph.EP' in cur_categories %}checked{% endif %}> astro-ph.EP</label>
+    <div class="category-pills">
+      <button class="category-all{% if cur_categories|length == 6 %} active{% endif %}" type="button" data-category-all>All</button>
+      <label class="category-pill"><input type="checkbox" name="categories" value="astro-ph.GA" {% if 'astro-ph.GA' in cur_categories %}checked{% endif %}><span>GA</span></label>
+      <label class="category-pill"><input type="checkbox" name="categories" value="astro-ph.SR" {% if 'astro-ph.SR' in cur_categories %}checked{% endif %}><span>SR</span></label>
+      <label class="category-pill"><input type="checkbox" name="categories" value="astro-ph.HE" {% if 'astro-ph.HE' in cur_categories %}checked{% endif %}><span>HE</span></label>
+      <label class="category-pill"><input type="checkbox" name="categories" value="astro-ph.CO" {% if 'astro-ph.CO' in cur_categories %}checked{% endif %}><span>CO</span></label>
+      <label class="category-pill"><input type="checkbox" name="categories" value="astro-ph.IM" {% if 'astro-ph.IM' in cur_categories %}checked{% endif %}><span>IM</span></label>
+      <label class="category-pill"><input type="checkbox" name="categories" value="astro-ph.EP" {% if 'astro-ph.EP' in cur_categories %}checked{% endif %}><span>EP</span></label>
     </div>
 
     <h3 style="font-size:14px;color:#2c3e50;margin:22px 0 10px">Research Profile</h3>
@@ -1203,6 +1230,26 @@ function toggleProfileMode() {
   document.getElementById('quick-mode').style.display = mode === 'quick' ? '' : 'none';
   document.getElementById('bib-mode').style.display = mode === 'bib' ? '' : 'none';
 }
+function initCategoryPills() {
+  document.querySelectorAll('[data-category-all]').forEach(function (allButton) {
+    const group = allButton.closest('.category-pills');
+    if (!group) return;
+    const boxes = Array.from(group.querySelectorAll('input[name="categories"]'));
+    function syncAllState() {
+      const selected = boxes.filter(function (box) { return box.checked; });
+      allButton.classList.toggle('active', selected.length === boxes.length);
+    }
+    allButton.addEventListener('click', function () {
+      const selectAll = boxes.some(function (box) { return !box.checked; });
+      boxes.forEach(function (box) { box.checked = selectAll; });
+      syncAllState();
+      if (window.markSettingsDirty) window.markSettingsDirty();
+    });
+    boxes.forEach(function (box) { box.addEventListener('change', syncAllState); });
+    syncAllState();
+  });
+}
+initCategoryPills();
 function updatePort() {
   const proto = document.getElementById('smtp_protocol').value;
   document.getElementById('smtp_port').value = proto === 'ssl' ? '465' : '587';
@@ -1224,10 +1271,11 @@ SETTINGS_TEMPLATE = """<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333}
-.header{background:#1a2332;color:#fff;padding:16px 32px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.header{height:74px;min-height:74px;background:#1a2332;color:#fff;padding:20px 32px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
 .header h1{font-size:20px;margin:0}
 .back-link{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:10px 12px;border-radius:8px;background:#f8fafc;border:1px solid #d1d5db;color:#1a2332;text-decoration:none;font-size:14px;font-weight:600;transition:background .15s,border-color .15s}
 .back-link:hover{background:#eef2f7;border-color:#9ca3af;color:#1a2332}
+.back-shortcut{color:#64748b;font-size:12px;font-weight:500}
 .layout{display:flex;align-items:flex-start;max-width:1100px;margin:0 auto;padding:24px 16px;gap:24px}
 .sidebar{width:220px;flex-shrink:0;background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.08);padding:10px;position:sticky;top:24px}
 .sidebar-back{margin-top:12px;padding-top:14px;border-top:1px solid #e5e7eb}
@@ -1246,9 +1294,16 @@ label{display:block;font-size:13px;font-weight:600;color:#555;margin-bottom:6px;
 input[type="text"],input[type="password"],select,textarea{width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:6px;font-size:14px;margin-bottom:4px}
 input:focus,select:focus,textarea:focus{outline:none;border-color:#2563eb;box-shadow:0 0 0 2px rgba(37,99,235,.15)}
 textarea{height:90px;resize:vertical}
-.checkbox-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}
-.checkbox-grid label{display:flex;align-items:center;gap:6px;font-weight:400;font-size:13px;margin:0}
-.checkbox-grid input{width:auto}
+.category-pills{display:flex;align-items:center;gap:4px;flex-wrap:nowrap;overflow:visible;margin-top:10px;padding:1px 0 2px}
+.category-pills::-webkit-scrollbar{display:none}
+.category-pill{display:block;flex:0 0 auto;margin:0;cursor:pointer}
+.category-pill input{position:absolute;opacity:0;pointer-events:none}
+.category-pill span{display:flex;align-items:center;justify-content:center;box-sizing:border-box;height:24px;padding:0 7px;border:1px solid #d1d5db;border-radius:999px;background:#fff;color:#475569;font-size:11px;font-weight:600;line-height:1;white-space:nowrap;transition:background .14s ease,border-color .14s ease,color .14s ease;cursor:pointer}
+.category-all{display:flex;align-items:center;justify-content:center;box-sizing:border-box;height:24px;flex:0 0 auto;margin:0 3px 0 0;padding:0 8px;border:1px solid #cbd5e1;border-radius:7px;background:#f8fafc;color:#475569;font-family:inherit;font-size:11px;font-weight:700;line-height:1;white-space:nowrap;appearance:none;transition:background .14s ease,border-color .14s ease,color .14s ease;cursor:pointer}
+.category-pill:hover span{border-color:#93c5fd;color:#1d4ed8}
+.category-all:hover{border-color:#64748b;color:#1e293b}
+.category-pill input:checked+span{border-color:#2563eb;background:#2563eb;color:#fff}
+.category-all.active{border-color:#1e293b;background:#1e293b;color:#fff}
 .toggle-group{display:flex;gap:12px;margin-bottom:12px}
 .toggle-group label{display:flex;align-items:center;gap:6px;font-weight:500;margin:0;cursor:pointer}
 .toggle-group input{width:auto}
@@ -1283,12 +1338,12 @@ textarea{height:90px;resize:vertical}
 .lp-btn.danger:hover{background:#fef2f2}
 .save-bar{position:sticky;bottom:16px;z-index:5;display:flex;align-items:center;justify-content:flex-end;gap:10px;padding:12px 16px;background:rgba(255,255,255,.96);border:1px solid #bfdbfe;border-radius:10px;box-shadow:0 8px 24px rgba(15,23,42,.14)}
 .save-bar[hidden]{display:none}.save-note{margin-right:auto;font-size:13px;color:#475569}.btn-secondary{background:#fff;color:#334155;border:1px solid #cbd5e1}.btn-secondary:hover{background:#f8fafc}
-.saved-notice{margin-bottom:16px;background:#ecfdf5;border:1px solid #a7f3d0;color:#047857;border-radius:8px;padding:10px 12px;font-size:13px}
+.saved-notice{display:flex;align-items:center;height:32px;box-sizing:border-box;margin-bottom:16px;padding:0 12px;background:#ecfdf5;border:1px solid #a7f3d0;color:#047857;border-radius:8px;font-size:12px;line-height:1.4}
 </style>
 </head>
 <body>
 <div class="header">
-  <h1>AstroPaperDigest - Settings</h1>
+  <h1><img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='20' height='20'%3E%3Cpath fill='%23fff' d='M19 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h13c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 14H7v-2h11v2zm0-4H7v-2h11v2zm0-4H7V6h11v2z'/%3E%3C/svg%3E" style="vertical-align:middle;margin-right:6px" width="20" height="20">AstroPaperDigest - Settings</h1>
 </div>
 <div class="layout">
   <nav class="sidebar">
@@ -1298,7 +1353,7 @@ textarea{height:90px;resize:vertical}
       <button class="nav-item" data-section="email" onclick="activate('email')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></span>Email Notification</button>
     </div>
     <div class="sidebar-back">
-      <a class="back-link" href="/">← Back to Digest</a>
+      <a class="back-link" href="/">← Back to Digest <span class="back-shortcut">(Esc)</span></a>
     </div>
   </nav>
   <main class="content">
@@ -1366,13 +1421,14 @@ textarea{height:90px;resize:vertical}
         <div class="card">
           <h2>Paper Categories</h2>
           <p class="sub">All official astro-ph papers are included and scored in every daily digest. These choices set the categories shown by default in the Digest view.</p>
-          <div class="checkbox-grid">
-            <label><input type="checkbox" name="categories" value="astro-ph.GA" {% if 'astro-ph.GA' in cur_categories %}checked{% endif %}> astro-ph.GA</label>
-            <label><input type="checkbox" name="categories" value="astro-ph.SR" {% if 'astro-ph.SR' in cur_categories %}checked{% endif %}> astro-ph.SR</label>
-            <label><input type="checkbox" name="categories" value="astro-ph.HE" {% if 'astro-ph.HE' in cur_categories %}checked{% endif %}> astro-ph.HE</label>
-            <label><input type="checkbox" name="categories" value="astro-ph.CO" {% if 'astro-ph.CO' in cur_categories %}checked{% endif %}> astro-ph.CO</label>
-            <label><input type="checkbox" name="categories" value="astro-ph.IM" {% if 'astro-ph.IM' in cur_categories %}checked{% endif %}> astro-ph.IM</label>
-            <label><input type="checkbox" name="categories" value="astro-ph.EP" {% if 'astro-ph.EP' in cur_categories %}checked{% endif %}> astro-ph.EP</label>
+          <div class="category-pills">
+            <button class="category-all{% if cur_categories|length == 6 %} active{% endif %}" type="button" data-category-all>All</button>
+            <label class="category-pill"><input type="checkbox" name="categories" value="astro-ph.GA" {% if 'astro-ph.GA' in cur_categories %}checked{% endif %}><span>GA</span></label>
+            <label class="category-pill"><input type="checkbox" name="categories" value="astro-ph.SR" {% if 'astro-ph.SR' in cur_categories %}checked{% endif %}><span>SR</span></label>
+            <label class="category-pill"><input type="checkbox" name="categories" value="astro-ph.HE" {% if 'astro-ph.HE' in cur_categories %}checked{% endif %}><span>HE</span></label>
+            <label class="category-pill"><input type="checkbox" name="categories" value="astro-ph.CO" {% if 'astro-ph.CO' in cur_categories %}checked{% endif %}><span>CO</span></label>
+            <label class="category-pill"><input type="checkbox" name="categories" value="astro-ph.IM" {% if 'astro-ph.IM' in cur_categories %}checked{% endif %}><span>IM</span></label>
+            <label class="category-pill"><input type="checkbox" name="categories" value="astro-ph.EP" {% if 'astro-ph.EP' in cur_categories %}checked{% endif %}><span>EP</span></label>
           </div>
         </div>
         <div class="card">
@@ -1440,6 +1496,26 @@ function toggleProfileMode() {
   document.getElementById('quick-mode').style.display = mode === 'quick' ? '' : 'none';
   document.getElementById('bib-mode').style.display = mode === 'bib' ? '' : 'none';
 }
+function initCategoryPills() {
+  document.querySelectorAll('[data-category-all]').forEach(function (allButton) {
+    const group = allButton.closest('.category-pills');
+    if (!group) return;
+    const boxes = Array.from(group.querySelectorAll('input[name="categories"]'));
+    function syncAllState() {
+      const selected = boxes.filter(function (box) { return box.checked; });
+      allButton.classList.toggle('active', selected.length === boxes.length);
+    }
+    allButton.addEventListener('click', function () {
+      const selectAll = boxes.some(function (box) { return !box.checked; });
+      boxes.forEach(function (box) { box.checked = selectAll; });
+      syncAllState();
+      if (window.markSettingsDirty) window.markSettingsDirty();
+    });
+    boxes.forEach(function (box) { box.addEventListener('change', syncAllState); });
+    syncAllState();
+  });
+}
+initCategoryPills();
 (function () {
   const provider = document.getElementById('provider');
   if (provider && provider.value === 'custom') {
@@ -1516,6 +1592,14 @@ function toggleProfileMode() {
       if (!dirty || confirm('Discard unsaved changes?')) return;
       event.preventDefault();
     });
+  });
+  document.addEventListener('keydown', function (event) {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    event.stopPropagation();
+    const link = document.querySelector('.back-link');
+    if (!link) return;
+    if (!dirty || confirm('Discard unsaved changes?')) window.location.href = link.href;
   });
 })();
 </script>
@@ -1730,7 +1814,7 @@ STATUS_PAGE = """<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333}
-.header{background:#1a2332;color:#fff;padding:20px 32px}
+.header{height:74px;min-height:74px;background:#1a2332;color:#fff;padding:20px 32px}
 .header h1{font-size:22px;margin-bottom:4px}
 .header .stats{color:#8899aa;font-size:14px}
 .sticky-wrapper{position:sticky;top:0;z-index:100;box-shadow:0 2px 8px rgba(0,0,0,.15)}
@@ -2007,7 +2091,7 @@ DIGEST_TEMPLATE = """<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333}
-.header{background:#1a2332;color:#fff;padding:20px 32px}
+.header{height:74px;min-height:74px;background:#1a2332;color:#fff;padding:20px 32px}
 .header h1{font-size:22px;margin-bottom:4px}
 .header .stats{color:#8899aa;font-size:14px}
 .sticky-wrapper{position:sticky;top:0;z-index:100;box-shadow:0 2px 8px rgba(0,0,0,.15)}
@@ -2061,19 +2145,24 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .btn-filter{height:36px;display:flex;align-items:center;gap:7px;padding:0 11px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#334155;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
 .btn-filter:hover,.btn-filter[aria-expanded="true"]{border-color:#93c5fd;background:#eff6ff;color:#1d4ed8}
 .filter-summary{color:#64748b;font-size:12px;font-weight:500}
-.filter-chevron{font-size:15px;line-height:1;transition:transform .16s ease}
-.btn-filter[aria-expanded="true"] .filter-chevron{transform:rotate(180deg)}
+.filter-chevron{display:inline-block;flex:0 0 auto;width:8px;height:8px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(45deg);transition:transform .16s ease}
+.btn-filter[aria-expanded="true"] .filter-chevron{transform:rotate(225deg)}
 .filter-popover{position:absolute;z-index:20;right:0;top:calc(100% + 8px);width:344px;padding:14px;border:1px solid #dbe3ee;border-radius:10px;background:#fff;box-shadow:0 12px 28px rgba(15,23,42,.16)}
 .filter-popover[hidden]{display:none}
 .filter-section+.filter-section{margin-top:14px;padding-top:14px;border-top:1px solid #e5e7eb}
 .filter-section-title{margin-bottom:8px;color:#64748b;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
 .filter-section-note{margin:-2px 0 9px;color:#94a3b8;font-size:12px;line-height:1.35}
-.filter-pills{display:flex;gap:7px;flex-wrap:wrap}
-.filter-pill{cursor:pointer}
+.filter-pills{display:flex;align-items:center;gap:4px;flex-wrap:nowrap;overflow:visible;padding:1px 0 2px}
+.filter-pills::-webkit-scrollbar{display:none}
+.filter-pill{display:block;flex:0 0 auto;margin:0;cursor:pointer}
 .filter-pill input{position:absolute;opacity:0;pointer-events:none}
-.filter-pill span{display:block;padding:6px 9px;border:1px solid #d1d5db;border-radius:999px;background:#fff;color:#475569;font-size:12px;line-height:1;white-space:nowrap;transition:background .14s ease,border-color .14s ease,color .14s ease}
+.filter-pill span{display:flex;align-items:center;justify-content:center;box-sizing:border-box;height:24px;padding:0 7px;border:1px solid #d1d5db;border-radius:999px;background:#fff;color:#475569;font-size:11px;line-height:1;white-space:nowrap;transition:background .14s ease,border-color .14s ease,color .14s ease}
 .filter-pill:hover span{border-color:#93c5fd;color:#1d4ed8}
 .filter-pill input:checked+span{border-color:#2563eb;background:#2563eb;color:#fff}
+.filter-all{flex:0 0 auto;margin-right:3px;padding:0;border:0;background:transparent}
+.filter-all span{border-radius:7px;background:#f8fafc;color:#475569;font-weight:700}
+.filter-all:hover span{border-color:#64748b;color:#1e293b}
+.filter-all.active span{border-color:#1e293b;background:#1e293b;color:#fff}
 .scope-options{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .scope-toggle{cursor:pointer}
 .scope-toggle input{position:absolute;opacity:0;pointer-events:none}
@@ -2114,13 +2203,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   {% for star in (5, 4, 3, 2, 1) %}<button class="btn-nav btn-nav-star nav-star-{{ star }}" data-score-nav="{{ star }}" aria-label="{{ star }}-star papers" onclick="scrollToScore({{ star }})">{{ '★' * star }} (<span class="btn-score-count">{{ score_counts.get(star, 0) }}</span>)</button>{% endfor %}
   <div class="filter-menu" id="filter-menu">
     <button class="btn-filter" type="button" id="filter-trigger" aria-expanded="false" aria-controls="filter-popover">
-      <span>Filters</span><span class="filter-summary" id="filter-summary"></span><span class="filter-chevron" aria-hidden="true">⌄</span>
+      <span>Filters</span><span class="filter-summary" id="filter-summary"></span><span class="filter-chevron" aria-hidden="true"></span>
     </button>
     <div class="filter-popover" id="filter-popover" hidden>
       <section class="filter-section" aria-label="Categories">
         <div class="filter-section-title">Categories</div>
         <div class="filter-section-note">Choose the research categories shown in this digest.</div>
         <div class="filter-pills">
+          <button class="filter-pill filter-all{% if display_categories|length == display_categories_all|length %} active{% endif %}" type="button" id="select-all-categories"><span>All</span></button>
           {% for category in display_categories_all %}
           <label class="filter-pill"><input class="digest-category" type="checkbox" value="{{ category }}" {% if category in display_categories %}checked{% endif %}><span>{{ category.replace('astro-ph.', '') }}</span></label>
           {% endfor %}
@@ -2222,7 +2312,41 @@ showScopeBanner();
 function applyCategoryDisplay() {
   filterCards();
 }
-document.querySelectorAll('.digest-category').forEach(function (input) { input.addEventListener('change', applyCategoryDisplay); });
+function selectedDisplayCategories() {
+  return Array.from(document.querySelectorAll('.digest-category:checked')).map(function (input) {
+    return input.value;
+  });
+}
+function updateAllCategoryButton() {
+  const allButton = document.getElementById('select-all-categories');
+  if (!allButton) return;
+  const total = document.querySelectorAll('.digest-category').length;
+  allButton.classList.toggle('active', selectedDisplayCategories().length === total);
+}
+function persistDisplayCategories() {
+  fetch('/preferences', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({display_categories: selectedDisplayCategories()})
+  });
+}
+function selectAllDisplayCategories(selectAll, persist) {
+  document.querySelectorAll('.digest-category').forEach(function (input) { input.checked = selectAll; });
+  updateAllCategoryButton();
+  applyCategoryDisplay();
+  if (persist) persistDisplayCategories();
+}
+function onCategoryDisplayChange() {
+  applyCategoryDisplay();
+  updateAllCategoryButton();
+  persistDisplayCategories();
+}
+document.querySelectorAll('.digest-category').forEach(function (input) { input.addEventListener('change', onCategoryDisplayChange); });
+document.getElementById('select-all-categories').addEventListener('click', function () {
+  const total = document.querySelectorAll('.digest-category').length;
+  const selectAll = selectedDisplayCategories().length !== total;
+  selectAllDisplayCategories(selectAll, true);
+});
 const filterMenu = document.getElementById('filter-menu');
 const filterTrigger = document.getElementById('filter-trigger');
 const filterPopover = document.getElementById('filter-popover');
@@ -2243,19 +2367,20 @@ document.addEventListener('click', function (event) {
 });
 document.addEventListener('keydown', function (event) {
   if (event.key === 'Escape' && !filterPopover.hidden) {
+    event.preventDefault();
+    event.stopPropagation();
     setFilterMenuOpen(false);
     filterTrigger.focus();
   }
 });
 applyCategoryDisplay();
+updateAllCategoryButton();
 function scrollToScore(score) {
-  const card = Array.from(document.querySelectorAll('.card')).find(function (item) {
-    return Number(item.dataset.score || 0) === score && item.style.display !== 'none';
-  });
-  if (!card) return;
+  const header = document.querySelector('.tier-header[data-tier="' + tierKey(score) + '"]');
+  if (!header || header.style.display === 'none') return;
   const sticky = document.querySelector('.sticky-wrapper');
   const offset = sticky ? sticky.getBoundingClientRect().height + 12 : 12;
-  const top = card.getBoundingClientRect().top + window.scrollY - offset;
+  const top = header.getBoundingClientRect().top + window.scrollY - offset;
   window.scrollTo({top: Math.max(0, top), behavior:'smooth'});
 }
 function tierKey(score) {
@@ -2450,7 +2575,7 @@ function filterCards() {
   allCards.forEach(card => {
     const type = card.dataset.paperType || 'new';
     const categories = String(card.dataset.categories || '').split(',').map(function (item) { return item.trim(); });
-    let show = selectedCategories.length === 0 || categories.some(function (category) {
+    let show = selectedCategories.length > 0 && categories.some(function (category) {
       return selectedCategories.indexOf(category) >= 0;
     });
     
@@ -2547,7 +2672,7 @@ NO_DIGEST_TEMPLATE = """<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333}
-.header{background:#1a2332;color:#fff;padding:20px 32px}
+.header{height:74px;min-height:74px;background:#1a2332;color:#fff;padding:20px 32px}
 .header h1{font-size:22px;margin-bottom:4px}
 .header .stats{color:#8899aa;font-size:14px}
 .sticky-wrapper{position:sticky;top:0;z-index:100;box-shadow:0 2px 8px rgba(0,0,0,.15)}
@@ -2902,7 +3027,7 @@ def _render_digest(digest=None):
         DIGEST_TEMPLATE,
         digest=d,
         prefs=prefs,
-        display_categories=cfg.get("arxiv_categories") or list(_DEFAULT_ARXIV_CATEGORIES),
+        display_categories=cfg["arxiv_categories"] if "arxiv_categories" in cfg else list(_DEFAULT_ARXIV_CATEGORIES),
         display_categories_all=list(_DEFAULT_ARXIV_CATEGORIES),
         today_str=today_str,
         full_abstracts=full_abstracts,
@@ -3140,6 +3265,10 @@ def post_preferences():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         abort(400, "Expected a JSON object.")
+    if "display_categories" in data:
+        if not isinstance(data["display_categories"], list):
+            abort(400, "display_categories must be a list.")
+        _save_display_categories(data["display_categories"])
     prefs = load_preferences()
     if isinstance(data.get("include_cross"), bool):
         prefs["include_cross"] = data["include_cross"]
