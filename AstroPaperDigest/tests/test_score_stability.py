@@ -151,7 +151,7 @@ def main():
         llm_cfg.get("base_url", "https://api.deepseek.com"),
         api_key,
     )
-    model = llm_cfg.get("model", "deepseek-v4-flash")
+    model = llm_cfg.get("model", "deepseek-v4-flash-vision-exp")
     messages = [
         {"role": "system", "content": "You are an astrophysics research assistant. Respond only with valid JSON."},
         {"role": "user", "content": prompt},

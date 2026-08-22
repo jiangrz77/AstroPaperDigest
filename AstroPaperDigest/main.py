@@ -21,9 +21,10 @@ _PROJECT_DIR = _paths.data_dir()
 load_dotenv(_PROJECT_DIR / ".env")
 os.chdir(_PROJECT_DIR)
 
-from src.profile import build_profile, build_profile_from_config
+from src.profile import build_profile, build_profile_from_config, build_profile_from_zotero
+from src.zotero import ZoteroReadError
 from src.fetch_arxiv import fetch_daily_batch
-from src.ranker import rank_papers
+from src.ranker import APIKeyError, rank_papers
 from src.output import write_bibtex, write_digest, generate_markdown_digest
 from src.notifier import send_digest_email
 from src.digest_parser import parse_digest, get_latest_digest_path
@@ -131,7 +132,7 @@ def main():
     parser.add_argument(
         "--update-profile",
         action="store_true",
-        help="Re-extract interest profile from bib file and print summary"
+        help="Re-extract the configured interest profile and print its summary"
     )
     parser.add_argument(
         "--dry-run",
@@ -177,14 +178,32 @@ def main():
     # Step 1: Build interest profile
     print("[1/5] Building interest profile...")
     emit("profile", 1, 1, "Building interest profile…")
-    bib_path = config.get("bib_file", "")
-    if bib_path and os.path.exists(bib_path):
-        profile = build_profile(bib_path)
-        print(f"  Parsed {len(profile['all_entries'])} entries from {bib_path}")
-        print(f"  Top categories: {', '.join(f'{c}({n})' for c, n in profile['categories'].most_common(5))}")
+    profile_source = config.get("profile_source")
+    if not profile_source:
+        profile_source = "bib" if config.get("bib_file") else "quick"
+
+    if profile_source == "zotero":
+        try:
+            profile = build_profile_from_zotero(config.get("zotero_db", ""))
+        except ZoteroReadError as exc:
+            print(f"ERROR: Failed to read Zotero database: {exc}")
+            sys.exit(2)
+        summary = profile["zotero_summary"]
+        print(f"  Read {summary['item_count']} Zotero items from {profile['zotero_path']}")
+        print(f"  Tags: {summary['tag_count']} | Collections: {summary['collection_count']}")
+    elif profile_source == "bib":
+        bib_path = config.get("bib_file", "")
+        if bib_path and os.path.exists(bib_path):
+            profile = build_profile(bib_path)
+            print(f"  Parsed {len(profile['all_entries'])} entries from {bib_path}")
+            print(f"  Top categories: {', '.join(f'{c}({n})' for c, n in profile['categories'].most_common(5))}")
+        else:
+            if bib_path:
+                print(f"  Bib file not found: {bib_path}")
+            print("  Using keywords from config.yaml as interest profile")
+            profile = build_profile_from_config(config)
+            print(f"  Keywords: {len(profile['keywords'])} | Categories: {len(profile['categories'])}")
     else:
-        if bib_path:
-            print(f"  Bib file not found: {bib_path}")
         print("  Using keywords from config.yaml as interest profile")
         profile = build_profile_from_config(config)
         print(f"  Keywords: {len(profile['keywords'])} | Categories: {len(profile['categories'])}")
@@ -312,7 +331,11 @@ def main():
         print(f"\n[4/5] Ranking {len(candidates)} papers with LLM...")
         emit("rank", 0, 0, "Starting…")
         llm_config = config.get("llm", {})
-        ranked = rank_papers(candidates, profile, llm_config)
+        try:
+            ranked = rank_papers(candidates, profile, llm_config)
+        except APIKeyError as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(2)
     
     if not ranked:
         print("  Warning: No papers were successfully scored. Writing empty digest.")

@@ -150,7 +150,7 @@ def test_ranker_with_mock():
     llm_config = {
         "base_url": "https://api.deepseek.com",
         "api_key_env": "DEEPSEEK_API_KEY",
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-v4-flash-vision-exp",
     }
     
     with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}):
@@ -196,7 +196,7 @@ def test_ranker_none_response():
     llm_config = {
         "base_url": "https://api.deepseek.com",
         "api_key_env": "DEEPSEEK_API_KEY",
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-v4-flash-vision-exp",
     }
     
     with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}):
@@ -233,7 +233,7 @@ def test_ranker_markdown_wrapped_json():
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = mock_completion
     
-    llm_config = {"base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "model": "deepseek-v4-flash"}
+    llm_config = {"base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "model": "deepseek-v4-flash-vision-exp"}
     
     with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}):
         with patch("src.ranker.get_client", return_value=mock_client):
@@ -267,7 +267,7 @@ def test_ranker_string_score():
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = mock_completion
     
-    llm_config = {"base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "model": "deepseek-v4-flash"}
+    llm_config = {"base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "model": "deepseek-v4-flash-vision-exp"}
     
     with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}):
         with patch("src.ranker.get_client", return_value=mock_client):

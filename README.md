@@ -9,6 +9,7 @@ Automatically fetches, filters, and ranks daily astrophysics papers based on you
 - **LLM ranking**: DeepSeek (or any OpenAI-compatible API) scores paper relevance 1-10
 - **Desktop UI**: Native macOS window (WebKit) with date navigation, tiered browsing, and real-time filtering
 - **Setup wizard**: First-launch wizard for API key and research interests
+- **Zotero library**: Read a local Zotero database directly to build the research profile
 - **Dual output**: BibTeX entries + Markdown digest, organized by date
 - **macOS app**: Double-click to run, opens a native desktop window
 
@@ -28,6 +29,25 @@ Automatically fetches, filters, and ranks daily astrophysics papers based on you
 
 1. Double-click **`Install.command`** — sets up Python environment and builds the app
 2. Double-click **`AstroPaperDigest.app`** — a native desktop window opens automatically
+
+## Zotero research profile
+
+In **Settings → Research Profile**, select **Use Zotero Library**. The app first tries the default database location:
+
+```text
+~/Zotero/zotero.sqlite
+```
+
+When you save the profile setting, AstroPaperDigest immediately reads a private copy in read-only mode and validates the library. If the default location cannot be read, the Settings page explains the error and asks for the real `zotero.sqlite` path. For custom data locations, check Zotero **Settings → Advanced → Files and Folders**.
+
+After a custom path succeeds, it is saved for later runs. The same setting can be written directly in `config.yaml`:
+
+```yaml
+profile_source: zotero
+zotero_db: ~/Zotero/zotero.sqlite
+```
+
+Missing, unreadable, invalid, or incompatible databases are reported explicitly; the app does not silently switch to a keyword or BibTeX profile.
 
 ## Auto Update
 

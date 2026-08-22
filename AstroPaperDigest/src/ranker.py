@@ -34,6 +34,29 @@ RETRY_BACKOFF_429 = 30.0 # seconds before a retry after HTTP 429 (rate limited)
 MAX_ATTEMPTS_429 = 3     # total tries for rate-limited calls (initial + 2 retries)
 
 
+class APIKeyError(ValueError):
+    """Raised when the configured LLM API key is missing or rejected."""
+
+
+def is_api_key_error(exc: Exception) -> bool:
+    """Return whether an LLM exception indicates an unusable API key."""
+    status_code = getattr(exc, "status_code", None)
+    if status_code in (401, 403):
+        return True
+
+    error_name = exc.__class__.__name__.lower()
+    error_text = str(exc).lower()
+    auth_names = ("authentication", "permissiondenied", "unauthorized")
+    if any(marker in error_name for marker in auth_names):
+        return True
+
+    key_markers = ("api key", "apikey", "invalid key", "incorrect key")
+    auth_markers = ("invalid", "incorrect", "unauthorized", "authentication", "not valid", "rejected")
+    return any(marker in error_text for marker in key_markers) and any(
+        marker in error_text for marker in auth_markers
+    )
+
+
 def split_papers_into_batches(papers: list, target: int = TARGET_BATCH_SIZE) -> list:
     """Split papers into a small number of balanced batches (~target each).
 
@@ -237,12 +260,13 @@ def rank_papers(
     api_key_env = llm_config.get("api_key_env", "DEEPSEEK_API_KEY")
     api_key = os.environ.get(api_key_env)
     if not api_key:
-        raise ValueError(
-            f"API key not found. Set the {api_key_env} environment variable."
+        raise APIKeyError(
+            "LLM API key is unavailable. Add a valid API key in Settings → "
+            "Update & About → LLM & API, then run the digest again."
         )
 
     base_url = llm_config.get("base_url", "https://api.deepseek.com")
-    model = llm_config.get("model", "deepseek-v4-flash")
+    model = llm_config.get("model", "deepseek-v4-flash-vision-exp")
 
     learned_profile = ensure_learned_profile(
         config_keywords=list((profile.get("keywords") or {}).keys())
@@ -297,6 +321,12 @@ def rank_papers(
                     )
                 return items, ""
             except Exception as e:
+                if is_api_key_error(e):
+                    raise APIKeyError(
+                        "LLM API key is unavailable or was rejected. Update it in "
+                        "Settings → Update & About → LLM & API, then run the "
+                        "digest again."
+                    ) from e
                 last_error = str(e) or e.__class__.__name__
                 is_429 = getattr(e, "status_code", None) == 429
                 max_attempts = MAX_ATTEMPTS_429 if is_429 else RETRY_ATTEMPTS + 1
@@ -339,6 +369,10 @@ def rank_papers(
             b, _ = futures[fut]
             try:
                 fut.result()  # surface unexpected worker errors
+            except APIKeyError:
+                for pending in futures:
+                    pending.cancel()
+                raise
             except Exception:
                 pass  # _vote degrades gracefully on its own
             batch_votes_done[b] += 1

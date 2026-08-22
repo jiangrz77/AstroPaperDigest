@@ -1,9 +1,12 @@
-"""Parse the user's BibTeX collection to build an interest profile."""
+"""Build a research-interest profile from BibTeX, keywords, or Zotero."""
 
 import re
 from collections import Counter
+from typing import Optional
 
 import bibtexparser
+
+from .zotero import read_zotero_library
 
 
 def parse_bib(bib_path: str) -> list[dict]:
@@ -114,14 +117,45 @@ def build_profile(bib_path: str) -> dict:
       - all_entries: all parsed entries
     """
     entries = parse_bib(bib_path)
-    
-    return {
+    return _build_profile_from_entries(entries)
+
+
+def _build_profile_from_entries(entries: list[dict], collections: Optional[list[str]] = None) -> dict:
+    """Build the shared profile shape from normalized bibliography entries."""
+    profile = {
         "categories": extract_categories(entries),
         "keywords": extract_keywords(entries),
         "topic_phrases": extract_topic_phrases(entries),
         "recent_titles": extract_recent_titles(entries),
         "all_entries": entries,
     }
+    if collections:
+        # Top-level Zotero collections are explicit topic anchors.  Count each
+        # once so they enrich the LLM prompt without being copied into every
+        # paper entry.
+        for collection in collections:
+            collection = collection.strip()
+            if collection:
+                profile["keywords"][collection] += 1
+    return profile
+
+
+def build_profile_from_zotero(zotero_db: str = "") -> dict:
+    """Read Zotero and convert its items into the existing profile shape."""
+    library = read_zotero_library(zotero_db or None)
+    profile = _build_profile_from_entries(
+        library["entries"],
+        collections=library.get("collections", []),
+    )
+    profile["source"] = "zotero"
+    profile["zotero_path"] = library["database_path"]
+    profile["zotero_summary"] = {
+        "item_count": library["item_count"],
+        "deleted_count": library["deleted_count"],
+        "tag_count": library["tag_count"],
+        "collection_count": library["collection_count"],
+    }
+    return profile
 
 
 def build_profile_from_config(config: dict) -> dict:
@@ -170,5 +204,14 @@ def profile_to_prompt_text(profile: dict, max_recent: int = 10) -> str:
     lines.append(f"\nExamples of recent papers of interest (up to {max_recent}):")
     for title in profile["recent_titles"][:max_recent]:
         lines.append(f"  - {title}")
+
+    zotero_summary = profile.get("zotero_summary")
+    if zotero_summary:
+        lines.append(
+            "\nZotero library: "
+            f"{zotero_summary['item_count']} items, "
+            f"{zotero_summary['tag_count']} tags, "
+            f"{zotero_summary['collection_count']} collections"
+        )
     
     return "\n".join(lines)

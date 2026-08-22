@@ -32,6 +32,15 @@ class MathJaxAssetTests(unittest.TestCase):
         self.assertIn('--add-data "$APP_ROOT/static:static"', build_script)
         self.assertTrue((PROJECT_DIR / "static" / "mathjax" / "tex-svg-full.js").is_file())
 
+    def test_regular_app_build_uses_native_bundle(self):
+        build_script = (PROJECT_DIR / "build_app.sh").read_text(encoding="utf-8")
+
+        self.assertIn("--windowed", build_script)
+        self.assertIn("--osx-bundle-identifier", build_script)
+        self.assertIn("--icon", build_script)
+        self.assertIn("codesign --force --deep", build_script)
+        self.assertNotIn("osascript", build_script)
+
 
 if __name__ == "__main__":
     unittest.main()

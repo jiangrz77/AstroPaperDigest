@@ -59,11 +59,10 @@ keywords:
 - neutron star
 - gravitational wave
 - machine learning
-bib_file: data/references-example.bib
 llm:
   base_url: https://api.deepseek.com
   api_key_env: DEEPSEEK_API_KEY
-  model: deepseek-v4-flash
+  model: deepseek-v4-flash-vision-exp
 output:
   bibtex_dir: ./output/bibtex
   digest_dir: ./output/digests
@@ -93,8 +92,5 @@ arxiv_schedule:
   - '2026-12-29'
   - '2026-12-31'
 update:
-  # Update source: public GitHub repository (the client checks anonymously via the GitHub Releases API).
-  # If the repository is private, you can self-host a static JSON update source instead
-  # (upload the version.json produced by release.sh to any static host, and change the
-  # github_repo setting below).
   github_repo: jiangrz77/AstroPaperDigest
+profile_source: zotero

@@ -22,6 +22,7 @@ from datetime import date, datetime, time as datetime_time
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread, Timer
+from urllib.parse import urlencode
 
 from flask import Flask, abort, jsonify, redirect, render_template_string, request
 from werkzeug.serving import make_server
@@ -49,6 +50,8 @@ from src.preference_learning import (
 from src.feedback_state import apply_to_digest, clear_date, get_adjustment, record_adjustment
 from src.progress import parse as parse_progress
 from src.scoring import apply_source_adjustment, feedback_step, score_to_stars
+from src.profile import build_profile_from_zotero
+from src.zotero import DEFAULT_ZOTERO_DB, ZoteroReadError
 
 FEEDBACK_FILE = os.path.join(_PROJECT_DIR, "feedback.json")
 PREFERENCES_FILE = os.path.join(_PROJECT_DIR, "preferences.json")
@@ -100,6 +103,7 @@ _DEFAULT_ARXIV_CATEGORIES = (
     "astro-ph.IM",
     "astro-ph.EP",
 )
+_SETTINGS_SECTIONS = {"general", "interests", "email", "update"}
 _BATCH_SUMMARY_RE = re.compile(
     r"Official astro-ph batch: (?P<official>\d+) papers\. "
     r"All (?P<selected>\d+) papers will be scored\. Default display "
@@ -235,10 +239,12 @@ def _apply_interests(config: dict, request) -> None:
     # longer limit what is fetched or scored.
     config["arxiv_categories"] = categories
     if profile_mode == "quick":
+        config["profile_source"] = "quick"
         config.pop("bib_file", None)
         keywords_raw = request.form.get("keywords", "").strip()
         config["keywords"] = [k.strip() for k in keywords_raw.split(",") if k.strip()]
-    else:
+    elif profile_mode == "bib":
+        config["profile_source"] = "bib"
         bib_file = request.files.get("bib_file")
         bib_path = request.form.get("bib_path", "").strip()
         if bib_file and bib_file.filename:
@@ -251,6 +257,33 @@ def _apply_interests(config: dict, request) -> None:
             config["bib_file"] = f"data/{filename}"
         elif bib_path:
             config["bib_file"] = bib_path
+    elif profile_mode == "zotero":
+        config["profile_source"] = "zotero"
+        config.pop("bib_file", None)
+        zotero_path = request.form.get("zotero_db", "").strip()
+        if zotero_path and zotero_path != str(DEFAULT_ZOTERO_DB):
+            config["zotero_db"] = zotero_path
+        else:
+            # An empty setting means automatic lookup of the default path.
+            config.pop("zotero_db", None)
+
+
+def _configured_profile_source(config: dict) -> str:
+    """Return the configured profile source with backward-compatible defaults."""
+    source = config.get("profile_source")
+    if source:
+        return source
+    return "bib" if config.get("bib_file") else "quick"
+
+
+def _read_configured_zotero(config: dict):
+    """Read the selected Zotero source for settings-time validation."""
+    if _configured_profile_source(config) != "zotero":
+        return None
+    profile = build_profile_from_zotero(config.get("zotero_db", ""))
+    summary = dict(profile.get("zotero_summary") or {})
+    summary["database_path"] = profile.get("zotero_path", "")
+    return summary
 
 
 def _normalize_display_categories(categories) -> list:
@@ -309,13 +342,14 @@ def _apply_email(config: dict, env_values: dict, enable_email: bool,
 def _setup_context() -> dict:
     """Build the shared template context for /setup and /settings."""
     cfg, env_vars = _load_config_and_env()
+    profile_source = _configured_profile_source(cfg)
     email_cfg = cfg.get("email", {})
     llm_cfg = cfg.get("llm", {})
     api_key_env = llm_cfg.get("api_key_env", "DEEPSEEK_API_KEY")
     provider = {"DEEPSEEK_API_KEY": "deepseek", "OPENAI_API_KEY": "openai"}.get(api_key_env, "custom")
     return {
         "cur_provider": provider,
-        "cur_model": llm_cfg.get("model", "deepseek-v4-flash"),
+        "cur_model": llm_cfg.get("model", "deepseek-v4-flash-vision-exp"),
         "cur_base_url": llm_cfg.get("base_url", ""),
         "cur_api_key": env_vars.get(
             "DEEPSEEK_API_KEY",
@@ -326,6 +360,9 @@ def _setup_context() -> dict:
         "cur_categories": cfg["arxiv_categories"] if "arxiv_categories" in cfg else list(_DEFAULT_ARXIV_CATEGORIES),
         "cur_keywords": ", ".join(cfg.get("keywords", [])),
         "cur_bib_file": cfg.get("bib_file", ""),
+        "cur_profile_source": profile_source,
+        "cur_zotero_db": cfg.get("zotero_db", str(DEFAULT_ZOTERO_DB)),
+        "zotero_feedback": None,
         "cur_email_sender": email_cfg.get("sender", ""),
         "cur_email_recipient": email_cfg.get("recipient", ""),
         "cur_smtp_server": email_cfg.get("smtp_server", ""),
@@ -334,6 +371,12 @@ def _setup_context() -> dict:
         "cur_email_enabled": email_cfg.get("enabled", False),
         "cur_email_password": env_vars.get("EMAIL_APP_PASSWORD", ""),
     }
+
+
+def _settings_section_from_request() -> str:
+    """Return the settings section that was active when the form was saved."""
+    section = request.form.get("settings_section", "general").strip().lower()
+    return section if section in _SETTINGS_SECTIONS else "general"
 
 
 def _update_config() -> dict:
@@ -845,7 +888,22 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
             _pipeline_status = "error"
             _pipeline_progress.update({"stage": "error"})
             # Show a cleaner error message
-            if "HTTPError" in stdout and "429" in stdout:
+            output_lower = (stdout or "").lower()
+            api_key_failure = (
+                "llm api key is unavailable" in output_lower
+                or "api key not found" in output_lower
+                or ("authentication" in output_lower and "api key" in output_lower)
+                or "invalid api key" in output_lower
+                or "incorrect api key" in output_lower
+                or "unauthorized" in output_lower and "api" in output_lower
+            )
+            if api_key_failure:
+                _pipeline_message = (
+                    "LLM API key unavailable or rejected.\n\n"
+                    "Open Settings → Update & About → LLM & API to add or replace "
+                    "the key, then run the digest again."
+                )
+            elif "HTTPError" in stdout and "429" in stdout:
                 _pipeline_message = (
                     "arXiv API rate limit exceeded (HTTP 429).\n\n"
                     "To avoid adding more load, AstroPaperDigest stopped "
@@ -1119,6 +1177,9 @@ textarea{height:80px;resize:vertical}
 .toggle-group label{display:flex;align-items:center;gap:6px;font-weight:500;margin:0;cursor:pointer}
 .toggle-group input{width:auto}
 .hint{font-size:12px;color:#999;margin-top:4px}
+.profile-feedback{margin-top:10px;padding:10px 12px;border-radius:6px;font-size:12px;line-height:1.5;white-space:pre-line}
+.profile-feedback.success{background:#ecfdf5;color:#166534}
+.profile-feedback.error{background:#fff1f2;color:#be123c}
 .btn-submit{display:block;width:100%;padding:14px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;margin-top:24px}
 .btn-submit:hover{background:#1d4ed8}
 </style>
@@ -1141,7 +1202,7 @@ textarea{height:80px;resize:vertical}
     <label for="api_key">API Key</label>
     <input type="password" id="api_key" name="api_key" placeholder="sk-..." value="{{ cur_api_key or '' }}" required>
     <label for="model">Model</label>
-    <input type="text" id="model" name="model" value="{{ cur_model or 'deepseek-v4-flash' }}">
+    <input type="text" id="model" name="model" value="{{ cur_model or 'deepseek-v4-flash-vision-exp' }}">
     <div id="baseurl-group" style="display:none">
       <label for="base_url">Base URL</label>
       <input type="text" id="base_url" name="base_url" placeholder="https://api.example.com/v1" value="{{ cur_base_url or '' }}">
@@ -1164,8 +1225,9 @@ textarea{height:80px;resize:vertical}
 
     <h3 style="font-size:14px;color:#2c3e50;margin:22px 0 10px">Research Profile</h3>
     <div class="toggle-group">
-      <label><input type="radio" name="profile_mode" value="quick" checked onchange="toggleProfileMode()"> Quick Start</label>
-      <label><input type="radio" name="profile_mode" value="bib" onchange="toggleProfileMode()"> Use Bib File</label>
+      <label><input type="radio" name="profile_mode" value="quick" {% if cur_profile_source == 'quick' %}checked{% endif %} onchange="toggleProfileMode()"> Quick Start</label>
+      <label><input type="radio" name="profile_mode" value="bib" {% if cur_profile_source == 'bib' %}checked{% endif %} onchange="toggleProfileMode()"> Use Bib File</label>
+      <label><input type="radio" name="profile_mode" value="zotero" {% if cur_profile_source == 'zotero' %}checked{% endif %} onchange="toggleProfileMode()"> Use Zotero Library</label>
     </div>
     <div id="quick-mode">
       <label for="keywords">Keywords (comma-separated)</label>
@@ -1178,6 +1240,14 @@ textarea{height:80px;resize:vertical}
       <label for="bib_path" style="margin-top:10px">Or enter a file path</label>
       <input type="text" id="bib_path" name="bib_path" placeholder="/path/to/your/collection.bib" value="{{ cur_bib_file or '' }}">
       <p class="hint">We'll extract your research profile automatically from your bibliography.</p>
+    </div>
+    <div id="zotero-mode" {% if cur_profile_source != 'zotero' %}style="display:none"{% endif %}>
+      <label for="zotero_db">Zotero database path (optional)</label>
+      <input type="text" id="zotero_db" name="zotero_db" placeholder="~/Zotero/zotero.sqlite" value="{{ cur_zotero_db or '' }}">
+      <p class="hint">When you save, the app first tries the default path and loads the library immediately. If it is not found, this page will ask for the real zotero.sqlite location.</p>
+      {% if zotero_feedback %}
+      <div class="profile-feedback {{ zotero_feedback.status }}">{{ zotero_feedback.message }}</div>
+      {% endif %}
     </div>
   </div>
 
@@ -1220,7 +1290,7 @@ function updateProvider() {
   const model = document.getElementById('model');
   const urlGroup = document.getElementById('baseurl-group');
   const baseUrl = document.getElementById('base_url');
-  if (p === 'deepseek') { model.value = 'deepseek-v4-flash'; urlGroup.style.display = 'none'; }
+  if (p === 'deepseek') { model.value = 'deepseek-v4-flash-vision-exp'; urlGroup.style.display = 'none'; }
   else if (p === 'openai') { model.value = 'gpt-4o-mini'; urlGroup.style.display = 'none'; }
   else { model.value = ''; urlGroup.style.display = 'block'; baseUrl.focus(); }
   if (window.markSettingsDirty) window.markSettingsDirty();
@@ -1229,6 +1299,7 @@ function toggleProfileMode() {
   const mode = document.querySelector('input[name="profile_mode"]:checked').value;
   document.getElementById('quick-mode').style.display = mode === 'quick' ? '' : 'none';
   document.getElementById('bib-mode').style.display = mode === 'bib' ? '' : 'none';
+  document.getElementById('zotero-mode').style.display = mode === 'zotero' ? '' : 'none';
 }
 function initCategoryPills() {
   document.querySelectorAll('[data-category-all]').forEach(function (allButton) {
@@ -1250,6 +1321,7 @@ function initCategoryPills() {
   });
 }
 initCategoryPills();
+toggleProfileMode();
 function updatePort() {
   const proto = document.getElementById('smtp_protocol').value;
   document.getElementById('smtp_port').value = proto === 'ssl' ? '465' : '587';
@@ -1308,6 +1380,9 @@ textarea{height:90px;resize:vertical}
 .toggle-group label{display:flex;align-items:center;gap:6px;font-weight:500;margin:0;cursor:pointer}
 .toggle-group input{width:auto}
 .hint{font-size:12px;color:#999;margin-top:4px}
+.profile-feedback{margin-top:10px;padding:10px 12px;border-radius:6px;font-size:12px;line-height:1.5;white-space:pre-line}
+.profile-feedback.success{background:#ecfdf5;color:#166534}
+.profile-feedback.error{background:#fff1f2;color:#be123c}
 .btn{padding:9px 18px;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer}
 .btn-primary{background:#2563eb;color:#fff}
 .btn-primary:hover{background:#1d4ed8}
@@ -1351,6 +1426,7 @@ textarea{height:90px;resize:vertical}
       <button class="nav-item active" data-section="general" onclick="activate('general')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>General</button>
       <button class="nav-item" data-section="interests" onclick="activate('interests')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></span>Research Interests</button>
       <button class="nav-item" data-section="email" onclick="activate('email')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></span>Email Notification</button>
+      <button class="nav-item" data-section="update" onclick="activate('update')"><span class="nav-icon"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/><path d="M12 7v5l3 2"/></svg></span>Update &amp; About</button>
     </div>
     <div class="sidebar-back">
       <a class="back-link" href="/">← Back to Digest <span class="back-shortcut">(Esc)</span></a>
@@ -1358,12 +1434,13 @@ textarea{height:90px;resize:vertical}
   </nav>
   <main class="content">
     <form id="settings-form" method="POST" action="/settings/save" enctype="multipart/form-data">
+    <input type="hidden" name="settings_section" id="settings-section" value="general">
     {% if saved %}<div class="saved-notice">Saved. Changes apply to your next digest.</div>{% endif %}
 
     <section class="panel active" id="panel-general">
       <div class="card">
         <h2>General</h2>
-        <p class="sub">Digest preferences and application updates.</p>
+        <p class="sub">Digest preferences.</p>
         <label class="check-line" style="margin-top:0">
           <input type="checkbox" id="pref-cross" name="include_cross" {% if prefs.include_cross %}checked{% endif %}>
           Include cross-listed papers
@@ -1374,6 +1451,28 @@ textarea{height:90px;resize:vertical}
         </label>
       </div>
 
+      <div class="card">
+        <h2>LLM &amp; API</h2>
+        <p class="sub">Configure the LLM provider used to score paper relevance.</p>
+          <label for="provider">Provider</label>
+          <select id="provider" name="provider" onchange="updateProvider()">
+            <option value="deepseek" {% if cur_provider == 'deepseek' %}selected{% endif %}>DeepSeek</option>
+            <option value="openai" {% if cur_provider == 'openai' %}selected{% endif %}>OpenAI</option>
+            <option value="custom" {% if cur_provider == 'custom' %}selected{% endif %}>Custom (OpenAI-compatible)</option>
+          </select>
+          <label for="api_key">API Key</label>
+          <input type="password" id="api_key" name="api_key" placeholder="sk-..." value="{{ cur_api_key or '' }}">
+          <label for="model">Model</label>
+          <input type="text" id="model" name="model" value="{{ cur_model or 'deepseek-v4-flash-vision-exp' }}">
+          <div id="baseurl-group" style="display:none">
+            <label for="base_url">Base URL</label>
+            <input type="text" id="base_url" name="base_url" placeholder="https://api.example.com/v1" value="{{ cur_base_url or '' }}">
+          </div>
+      </div>
+
+    </section>
+
+    <section class="panel" id="panel-update">
       <div class="card" id="update">
         <h2>Update</h2>
         <p class="sub">Current version: <span class="version-badge">v{{ current_version }}</span></p>
@@ -1397,24 +1496,6 @@ textarea{height:90px;resize:vertical}
         <a href="https://github.com/jiangrz77/AstroPaperDigest" target="_blank" style="font-size:13px;color:#2563eb">GitHub Repository ↗</a>
       </div>
 
-      <div class="card">
-        <h2>LLM &amp; API</h2>
-        <p class="sub">Configure the LLM provider used to score paper relevance.</p>
-          <label for="provider">Provider</label>
-          <select id="provider" name="provider" onchange="updateProvider()">
-            <option value="deepseek" {% if cur_provider == 'deepseek' %}selected{% endif %}>DeepSeek</option>
-            <option value="openai" {% if cur_provider == 'openai' %}selected{% endif %}>OpenAI</option>
-            <option value="custom" {% if cur_provider == 'custom' %}selected{% endif %}>Custom (OpenAI-compatible)</option>
-          </select>
-          <label for="api_key">API Key</label>
-          <input type="password" id="api_key" name="api_key" placeholder="sk-..." value="{{ cur_api_key or '' }}">
-          <label for="model">Model</label>
-          <input type="text" id="model" name="model" value="{{ cur_model or 'deepseek-v4-flash' }}">
-          <div id="baseurl-group" style="display:none">
-            <label for="base_url">Base URL</label>
-            <input type="text" id="base_url" name="base_url" placeholder="https://api.example.com/v1" value="{{ cur_base_url or '' }}">
-          </div>
-      </div>
     </section>
 
     <section class="panel" id="panel-interests">
@@ -1435,20 +1516,29 @@ textarea{height:90px;resize:vertical}
           <h2>Research Profile</h2>
           <p class="sub">Choose how AstroPaperDigest builds your relevance profile.</p>
           <div class="toggle-group">
-            <label><input type="radio" name="profile_mode" value="quick" {% if not cur_bib_file %}checked{% endif %} onchange="toggleProfileMode()"> Quick Start</label>
-            <label><input type="radio" name="profile_mode" value="bib" {% if cur_bib_file %}checked{% endif %} onchange="toggleProfileMode()"> Use Bib File</label>
+            <label><input type="radio" name="profile_mode" value="quick" {% if cur_profile_source == 'quick' %}checked{% endif %} onchange="toggleProfileMode()"> Quick Start</label>
+            <label><input type="radio" name="profile_mode" value="bib" {% if cur_profile_source == 'bib' %}checked{% endif %} onchange="toggleProfileMode()"> Use Bib File</label>
+            <label><input type="radio" name="profile_mode" value="zotero" {% if cur_profile_source == 'zotero' %}checked{% endif %} onchange="toggleProfileMode()"> Use Zotero Library</label>
           </div>
-          <div id="quick-mode" {% if cur_bib_file %}style="display:none"{% endif %}>
+          <div id="quick-mode" {% if cur_profile_source != 'quick' %}style="display:none"{% endif %}>
             <label for="keywords">Keywords (comma-separated)</label>
             <textarea id="keywords" name="keywords" placeholder="e.g. first stars, chemical evolution, supernova, stellar abundances">{{ cur_keywords or '' }}</textarea>
             <p class="hint">These help filter and rank papers relevant to your research.</p>
           </div>
-          <div id="bib-mode" {% if not cur_bib_file %}style="display:none"{% endif %}>
+          <div id="bib-mode" {% if cur_profile_source != 'bib' %}style="display:none"{% endif %}>
             <label>Upload your .bib file</label>
             <input type="file" name="bib_file" accept=".bib" style="width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:6px;font-size:14px">
             <label for="bib_path" style="margin-top:10px">Or enter a file path</label>
             <input type="text" id="bib_path" name="bib_path" placeholder="/path/to/your/collection.bib" value="{{ cur_bib_file or '' }}">
             <p class="hint">Your research profile is extracted automatically from the bibliography.</p>
+          </div>
+          <div id="zotero-mode" {% if cur_profile_source != 'zotero' %}style="display:none"{% endif %}>
+            <label for="zotero_db">Zotero database path (optional)</label>
+            <input type="text" id="zotero_db" name="zotero_db" placeholder="~/Zotero/zotero.sqlite" value="{{ cur_zotero_db or '' }}">
+            <p class="hint">Saving this setting reads the library immediately. The default path is tried first; if it fails, this page will show where Zotero usually stores zotero.sqlite and let you enter the real path.</p>
+            {% if zotero_feedback %}
+            <div class="profile-feedback {{ zotero_feedback.status }}">{{ zotero_feedback.message }}</div>
+            {% endif %}
           </div>
         </div>
       <div class="card" id="learned-preferences">
@@ -1487,7 +1577,7 @@ function updateProvider() {
   const model = document.getElementById('model');
   const urlGroup = document.getElementById('baseurl-group');
   const baseUrl = document.getElementById('base_url');
-  if (p === 'deepseek') { model.value = 'deepseek-v4-flash'; urlGroup.style.display = 'none'; }
+  if (p === 'deepseek') { model.value = 'deepseek-v4-flash-vision-exp'; urlGroup.style.display = 'none'; }
   else if (p === 'openai') { model.value = 'gpt-4o-mini'; urlGroup.style.display = 'none'; }
   else { model.value = ''; urlGroup.style.display = 'block'; baseUrl.focus(); }
 }
@@ -1495,6 +1585,7 @@ function toggleProfileMode() {
   const mode = document.querySelector('input[name="profile_mode"]:checked').value;
   document.getElementById('quick-mode').style.display = mode === 'quick' ? '' : 'none';
   document.getElementById('bib-mode').style.display = mode === 'bib' ? '' : 'none';
+  document.getElementById('zotero-mode').style.display = mode === 'zotero' ? '' : 'none';
 }
 function initCategoryPills() {
   document.querySelectorAll('[data-category-all]').forEach(function (allButton) {
@@ -1516,6 +1607,7 @@ function initCategoryPills() {
   });
 }
 initCategoryPills();
+toggleProfileMode();
 (function () {
   const provider = document.getElementById('provider');
   if (provider && provider.value === 'custom') {
@@ -1525,10 +1617,8 @@ initCategoryPills();
 </script>
 <script>
 (function () {
-  const SECTIONS = ["general", "interests", "email"];
+  const SECTIONS = ["general", "interests", "email", "update"];
   function activate(name) {
-    const requested = name;
-    if (name === "update") name = "general";
     if (SECTIONS.indexOf(name) < 0) name = "general";
     const panels = document.querySelectorAll(".panel");
     for (let i = 0; i < panels.length; i++) panels[i].classList.remove("active");
@@ -1538,11 +1628,9 @@ initCategoryPills();
     for (let j = 0; j < items.length; j++) {
       items[j].classList.toggle("active", items[j].getAttribute("data-section") === name);
     }
+    const sectionField = document.getElementById("settings-section");
+    if (sectionField) sectionField.value = name;
     if (history.replaceState) history.replaceState(null, "", "#" + name);
-    if (name === "general" && requested === "update") {
-      const upd = document.getElementById("update");
-      if (upd) setTimeout(function () { upd.scrollIntoView({behavior: "smooth", block: "start"}); }, 60);
-    }
   }
   window.activate = activate;
   window.addEventListener("hashchange", function () { activate(location.hash.slice(1)); });
@@ -1958,7 +2046,9 @@ function renderStatus(d) {
   const logContent = document.getElementById('log-content');
 
   stageEl.textContent = d.stage_label || 'Starting…';
-  msgEl.textContent = d.message || '';
+  // Errors are shown in the dedicated error panel below. Keeping the normal
+  // status line empty prevents the same API-key message from appearing twice.
+  msgEl.textContent = d.status === 'error' ? '' : (d.message || '');
   bar.classList.remove('indeterminate', 'error');
   bar.style.width = '';
 
@@ -1994,6 +2084,7 @@ function renderStatus(d) {
   }
 
   if (d.log && d.log.length) {
+    const apiKeyFailure = d.status === 'error' && /api key|apikey/i.test(d.message || '');
     logToggle.style.display = 'block';
     logContent.innerHTML = d.log.map(function (line) {
       const esc = String(line).replace(/[&<>"']/g, function (c) {
@@ -2003,7 +2094,7 @@ function renderStatus(d) {
       return '<div class="' + (isErr ? 'log-line-error' : '') + '">' + esc + '</div>';
     }).join('');
     logBox.scrollTop = logBox.scrollHeight;
-    if (d.status === 'error') {
+    if (d.status === 'error' && !apiKeyFailure) {
       logBox.style.display = 'block';
       logToggle.textContent = '▾ Hide run log';
     }
@@ -3273,6 +3364,13 @@ def settings_page():
     context["prefs"] = load_preferences()
     context["current_version"] = updater.get_current_version()
     context["saved"] = request.args.get("saved") == "1"
+    if request.args.get("zotero_loaded") == "1":
+        item_count = request.args.get("zotero_items", "").strip()
+        detail = f" — {item_count} items loaded" if item_count.isdigit() else ""
+        context["zotero_feedback"] = {
+            "status": "success",
+            "message": f"Zotero library loaded successfully{detail}. It will be used for the next digest.",
+        }
     return render_template_string(SETTINGS_TEMPLATE, **context)
 
 
@@ -3302,12 +3400,25 @@ def setup_submit():
     _write_env(env_values)
     _write_config(config)
     os.environ[api_key_env] = api_key
-    return redirect("/")
+    if _configured_profile_source(config) == "zotero":
+        try:
+            summary = _read_configured_zotero(config)
+        except ZoteroReadError as exc:
+            context = _setup_context()
+            context["zotero_feedback"] = {"status": "error", "message": str(exc)}
+            return render_template_string(SETUP_TEMPLATE, **context)
+        query = urlencode({
+            "saved": "1",
+            "zotero_loaded": "1",
+            "zotero_items": summary.get("item_count", 0),
+        })
+        return redirect(f"/settings?{query}#interests")
 
 
 @app.route("/settings/save", methods=["POST"])
 def settings_save():
     """Save all ordinary settings in one transaction."""
+    settings_section = _settings_section_from_request()
     config, env_values = _load_config_and_env()
     api_key = request.form.get("api_key", "").strip()
     api_key_env = _apply_llm(
@@ -3326,14 +3437,34 @@ def settings_save():
     _write_config(config)
     save_preferences(prefs)
     os.environ[api_key_env] = api_key
-    return redirect("/settings?saved=1#general")
+    if _configured_profile_source(config) == "zotero":
+        try:
+            summary = _read_configured_zotero(config)
+        except ZoteroReadError as exc:
+            context = _setup_context()
+            context["prefs"] = prefs
+            context["current_version"] = updater.get_current_version()
+            context["saved"] = False
+            context["zotero_feedback"] = {"status": "error", "message": str(exc)}
+            return render_template_string(SETTINGS_TEMPLATE, **context)
+        query = urlencode({
+            "saved": "1",
+            "zotero_loaded": "1",
+            "zotero_items": summary.get("item_count", 0),
+        })
+        return redirect(f"/settings?{query}#{settings_section}")
+    return redirect(f"/settings?saved=1#{settings_section}")
 @app.route("/")
 def index():
     """Landing page: show last viewed or latest digest."""
     if _pipeline_status == "running":
         prefs = load_preferences()
         display_date = prefs.get("last_viewed_date") or _digest_today_str()
-        return render_template_string(STATUS_PAGE, display_date=display_date, today_str=_digest_today_str())
+        return render_template_string(
+            STATUS_PAGE,
+            display_date=display_date,
+            today_str=_digest_today_str(),
+        )
     # Try last viewed date first
     prefs = load_preferences()
     last_date = prefs.get("last_viewed_date", "")
@@ -3407,7 +3538,11 @@ def digest_by_date(date_str):
             automatic=True,
         )
         if started or _pipeline_status == "running":
-            return render_template_string(STATUS_PAGE, display_date=date_str, today_str=today_str)
+            return render_template_string(
+                STATUS_PAGE,
+                display_date=date_str,
+                today_str=today_str,
+            )
         return render_template_string(
             NO_DIGEST_TEMPLATE,
             selected_date=date_str,
@@ -3461,7 +3596,11 @@ def run():
         include_replacements=prefs.get("include_replacements", True),
         target_date=target_date,
     )
-    return render_template_string(STATUS_PAGE, display_date=target_date or _digest_today_str(), today_str=_digest_today_str())
+    return render_template_string(
+        STATUS_PAGE,
+        display_date=target_date or _digest_today_str(),
+        today_str=_digest_today_str(),
+    )
 
 
 @app.route("/run/cancel", methods=["POST"])

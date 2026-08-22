@@ -9,12 +9,36 @@
 - **LLM 排序**：使用 DeepSeek（或任意 OpenAI 兼容 API）对论文相关性评分 1-10
 - **桌面界面**：原生 macOS 窗口（WebKit），支持日期导航、分层浏览、实时过滤
 - **设置向导**：首次启动引导配置 API 密钥和研究兴趣
+- **Zotero 文献库**：可直接读取本机 Zotero 数据库构建研究兴趣画像
 - **双格式输出**：BibTeX 条目 + Markdown 摘要，按日期归档
 - **macOS 应用**：双击即可运行，打开原生桌面窗口
 
 ## 快速开始
 
 > **注意：** 请勿在 `~/Downloads/` 下运行——macOS 会阻止下载的文件。请先将项目移动到固定位置（如 `~/Projects/`）。
+
+## 使用 Zotero 文献库
+
+在 **Settings → Research Profile** 中选择 **Use Zotero Library**。应用默认尝试读取：
+
+```text
+~/Zotero/zotero.sqlite
+```
+
+保存 Research Profile 设置后，应用会立即验证并读取文献库。应用会先复制数据库，再以只读方式读取，因此 Zotero 正在运行时通常也可以使用。
+
+如果默认位置读取失败，设置页会显示错误原因，并提示输入真实的 `zotero.sqlite` 路径。自定义数据目录可以在 Zotero 的 **Settings → Advanced → Files and Folders** 中查看。成功读取自定义路径后，应用会保存该路径供后续运行使用。
+
+配置文件也可以直接指定：
+
+```yaml
+profile_source: zotero
+zotero_db: ~/Zotero/zotero.sqlite
+```
+
+如果数据库不存在、没有权限、不是有效的 Zotero 数据库或结构不兼容，应用会报告错误，不会静默切换到关键词或 BibTeX profile。
+
+### 安装步骤
 
 1. 双击 **`Install.command`** —— 自动配置 Python 环境并构建应用
 2. 双击 **`AstroPaperDigest.app`** —— 原生桌面窗口自动打开
